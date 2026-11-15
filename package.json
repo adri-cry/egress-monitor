@@ -1,0 +1,32 @@
+{
+  "name": "egress-monitor",
+  "productName": "Egress Monitor",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Egress Rotator & Monitor - WARP IPv6 /64 rotator with a sing-box proxy engine and log-triggered rotation",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build",
+    "start": "npm run build && electron .",
+    "preview": "vite preview --host 127.0.0.1",
+    "engine:fetch": "node scripts/fetch-singbox.mjs",
+    "test:backend": "node scripts/test-backend.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "chokidar": "^4.0.3",
+    "lucide-react": "^1.73.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^44.11.3",
+    "tailwindcss": "^4.3.5",
+    "vite": "^8.3.8"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "proxy": { "host": "127.0.0.1", "port": 41987 },
+  "engine": {
+    "command": "engine/sing-box.exe",
+    "args": [],
+    "timeoutMs": 15000
+  },
+  "poolDir": "warp-configs",
+  "clientLogPath": "logs/client.log",
+  "edge": { "host": "engage.cloudflareclient.com", "prefer": "ipv4" },
+  "probe": {
+    "urls": [
+      "https://api64.ipify.org?format=json",
+      "https://api6.ipify.org?format=json",
+      "https://api.ipify.org?format=json"
+    ],
+    "timeoutMs": 9000,
+    "compareDirect": true
+  },
+  "guard": { "cooldownMs": 75000 },
+  "keeper": {
+    "intervalMs": 10000,
+    "failuresBeforeRestart": 2,
+    "heartbeatLogMs": 90000
+  },
+  "client": {
+    "desktop": {
+      "command": "",
+      "args": [],
+      "cwd": ""
+    },
+    "cli": {
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoExit",
+        "-Command",
+        "$env:HTTPS_PROXY='http://127.0.0.1:41987'; $env:HTTP_PROXY=$env:HTTPS_PROXY; $env:ALL_PROXY=$env:HTTPS_PROXY; Write-Host ('Egress proxy wired: ' + $env:HTTPS_PROXY)"
+      ],
+      "cwd": ""
+    }
+  },
+  "workspaceDir": "workspace",
+  "autoConnect": true
+}

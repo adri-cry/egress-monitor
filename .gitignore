@@ -1,0 +1,22 @@
+node_modules/
+dist/
+dist-preview/
+.vite/
+*.log
+.DS_Store
+Thumbs.db
+
+# local runtime state
+settings.json
+runtime/
+logs/
+workspace/
+
+# never commit WireGuard private keys
+warp-configs/*.conf
+!warp-configs/*.example
+
+# downloaded engine binaries (never commit ~90MB of binaries)
+engine/*.exe
+electron/*.exe
+electron/*.dll
