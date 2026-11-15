@@ -180,9 +180,11 @@ function defaultSettings() {
     clientLogPath: 'logs/client.log',
     edge: { host: 'engage.cloudflareclient.com', prefer: 'ipv4' },
     probe: {
+      // IPv6 first: a dual-stack endpoint answers over whichever family the
+      // client dialled, so /64 rotation would never show up. api6 is AAAA-only.
       urls: [
-        'https://api64.ipify.org?format=json',
         'https://api6.ipify.org?format=json',
+        'https://api64.ipify.org?format=json',
         'https://api.ipify.org?format=json',
       ],
       timeoutMs: 9000,

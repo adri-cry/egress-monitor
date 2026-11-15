@@ -10,8 +10,8 @@
   "edge": { "host": "engage.cloudflareclient.com", "prefer": "ipv4" },
   "probe": {
     "urls": [
-      "https://api64.ipify.org?format=json",
       "https://api6.ipify.org?format=json",
+      "https://api64.ipify.org?format=json",
       "https://api.ipify.org?format=json"
     ],
     "timeoutMs": 9000,

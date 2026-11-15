@@ -139,8 +139,8 @@ app after editing; pool and log folders can also be changed from the UI.
   "edge": { "host": "engage.cloudflareclient.com", "prefer": "ipv4" },
   "probe": {
     "urls": [
-      "https://api64.ipify.org?format=json",
       "https://api6.ipify.org?format=json",
+      "https://api64.ipify.org?format=json",
       "https://api.ipify.org?format=json"
     ],
     "timeoutMs": 9000,
@@ -201,6 +201,10 @@ recovers automatically if the engine exits unexpectedly.
 The `retired /64` metric counts only configs burned by a quota trigger (`reason === 'log-guard'`).
 Operator and keeper hops move the hop counter but are not retirements, and an IPv4 egress has no /64
 to record — so a healthy IPv4-only WARP session legitimately reports `retired 0`.
+
+Egress is probed with `api6.ipify.org` first because it is AAAA-only. A dual-stack endpoint such as
+`api64.ipify.org` answers over whichever family the client dialled, which would hide the /64 change
+behind an IPv4 address. Keep the IPv6 probe first if you reorder `probe.urls`.
 
 ## Verification
 

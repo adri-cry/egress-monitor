@@ -349,6 +349,7 @@ await test('normalizeSettings survives null and mistyped settings.json', async (
   assert.equal(defaults.proxy.port, 41987);
   assert.equal(defaults.engine.command, 'engine/sing-box.exe');
   assert.equal(defaults.probe.urls.length, 3);
+  assert.match(defaults.probe.urls[0], /api6\./, 'IPv6 probe must run first or /64 rotation stays invisible');
   assert.equal(defaults.logs.maxBytes, 2 * 1024 * 1024);
 
   const coerced = normalizeSettings({
