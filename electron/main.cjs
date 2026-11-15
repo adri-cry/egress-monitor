@@ -178,6 +178,8 @@ function defaultSettings() {
     },
     poolDir: 'warp-configs',
     clientLogPath: 'logs/client.log',
+    // Extra logs to watch in addition to clientLogPath (e.g. one per client).
+    clientLogPaths: [],
     edge: { host: 'engage.cloudflareclient.com', prefer: 'ipv4' },
     probe: {
       // IPv6 first: a dual-stack endpoint answers over whichever family the
@@ -271,6 +273,9 @@ function normalizeSettings(raw) {
   );
   settings.probe.urls = settings.probe.urls.filter((url) => /^https?:\/\//i.test(url));
   if (!settings.probe.urls.length) settings.probe.urls = [...defaults.probe.urls];
+  settings.clientLogPaths = (Array.isArray(settings.clientLogPaths) ? settings.clientLogPaths : [])
+    .filter((item) => typeof item === 'string' && item.trim())
+    .map((item) => item.trim());
   settings.edge.prefer = settings.edge.prefer === 'ipv6' ? 'ipv6' : 'ipv4';
   settings.engine.timeoutMs = clampInt(
     settings.engine.timeoutMs,
@@ -444,18 +449,39 @@ class LogBus {
 // chokidar log guard
 // ---------------------------------------------------------------------------
 
+/**
+ * Quota / rate-limit lines worth a hop. Clients name the same condition
+ * differently (`QuotaExceeded`, `FreeUsageLimitError`, `insufficient_quota`,
+ * `429 Too Many Requests`), so match the family, not one literal string.
+ */
+const QUOTA_PATTERN =
+  /quota[\s_-]*exceeded|freeusage|free usage limit|insufficient[\s_-]?quota|rate limit|too many requests/i;
+
 class LogGuard {
-  constructor({ filePath, onTrigger, onLog = null, cooldownMs = 75000, maxChunk = 512 * 1024 }) {
-    this.filePath = filePath;
+  constructor({
+    filePath = null,
+    filePaths = null,
+    onTrigger,
+    onLog = null,
+    cooldownMs = 75000,
+    maxChunk = 512 * 1024,
+    lookbackMs = 0,
+    maxScanBytes = 4 * 1024 * 1024,
+  }) {
+    const initial =
+      Array.isArray(filePaths) && filePaths.length ? filePaths : filePath ? [filePath] : [];
+    this.filePaths = [...new Set(initial.map((item) => path.resolve(String(item))))];
     this.onTrigger = onTrigger;
     this.onLog = onLog;
     this.cooldownMs = cooldownMs;
     this.maxChunk = maxChunk;
+    this.lookbackMs = lookbackMs;
+    this.maxScanBytes = Math.max(maxChunk, maxScanBytes);
 
-    this.offset = 0;
-    this.pending = '';
+    this.files = new Map(); // abs path -> { offset, pending }
     this.lastTriggerAt = 0;
     this.suppressedLoggedAt = 0;
+    this.deferred = null;
     this.watcher = null;
     this.scanning = false;
     this.queued = false;
@@ -466,34 +492,65 @@ class LogGuard {
     return Boolean(this.watcher);
   }
 
+  /** Primary file — kept for the IPC/UI path display. */
+  get filePath() {
+    return this.filePaths[0] ?? null;
+  }
+
+  async setPaths(list) {
+    this.filePaths = [...new Set((list || []).map((item) => path.resolve(String(item))))];
+    if (this.watcher) {
+      await this.stop();
+      await this.start();
+    }
+  }
+
+  stateFor(file) {
+    const key = path.resolve(String(file));
+    if (!this.files.has(key)) this.files.set(key, { offset: 0, pending: '' });
+    return this.files.get(key);
+  }
+
   async start() {
     if (this.watcher) return;
+    this.files = new Map();
 
-    await fsp.mkdir(path.dirname(this.filePath), { recursive: true });
-    if (!fssync.existsSync(this.filePath)) {
-      await fsp.writeFile(this.filePath, '');
+    for (const file of this.filePaths) {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      if (!fssync.existsSync(file)) await fsp.writeFile(file, '');
+
+      const stat = await fsp.stat(file).catch(() => null);
+      // Default to EOF: only lines that arrive after arming should hop, so a
+      // restart cannot re-hop on history. A quota written just before arming
+      // (mtime inside the lookback window) is still live though, so re-read
+      // one window for it.
+      const fresh =
+        Boolean(stat) && this.lookbackMs > 0 && Date.now() - stat.mtimeMs <= this.lookbackMs;
+      const offset = !stat
+        ? 0
+        : fresh
+          ? Math.max(0, stat.size - Math.min(stat.size, this.maxChunk))
+          : stat.size;
+      this.files.set(path.resolve(file), { offset, pending: '' });
     }
 
-    const stat = await fsp.stat(this.filePath);
-    // Start at EOF: only lines that arrive after the guard is armed can hop.
-    this.offset = stat.size;
-    this.pending = '';
-
-    this.watcher = chokidar.watch(this.filePath, {
+    this.watcher = chokidar.watch(this.filePaths, {
       ignoreInitial: true,
       awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
       alwaysStat: true,
     });
 
-    this.watcher.on('change', () => this.scan());
-    this.watcher.on('add', () => {
-      this.offset = 0;
-      this.pending = '';
-      this.scan();
+    this.watcher.on('change', (file) => this.scan(file));
+    this.watcher.on('add', (file) => {
+      const state = this.stateFor(file);
+      state.offset = 0;
+      state.pending = '';
+      this.scan(file);
     });
-    this.watcher.on('unlink', () => {
-      this.offset = 0;
-      this.pending = '';
+    this.watcher.on('unlink', (file) => {
+      const state = this.stateFor(file);
+      state.offset = 0;
+      state.pending = '';
     });
     this.watcher.on('error', (error) => {
       this.onLog?.('error', `log-guard watcher error: ${error.message}`);
@@ -506,9 +563,12 @@ class LogGuard {
         resolve();
       });
     });
+
+    // Pick up the lookback window, if any.
+    await this.scan();
   }
 
-  async scan() {
+  async scan(file = null) {
     if (this.scanning) {
       this.queued = true;
       return;
@@ -516,56 +576,8 @@ class LogGuard {
     this.scanning = true;
 
     try {
-      const stat = await fsp.stat(this.filePath).catch(() => null);
-      if (!stat) return;
-
-      if (stat.size < this.offset) {
-        this.offset = 0;
-        this.pending = '';
-      }
-      if (stat.size === this.offset) return;
-
-      const start = Math.max(this.offset, stat.size - this.maxChunk);
-      const chunk = await readRange(this.filePath, start, stat.size - 1);
-      this.offset = stat.size;
-
-      const combined = this.pending + chunk;
-      this.pending = combined.slice(-64);
-
-      if (!combined.includes('QuotaExceeded')) return;
-
-      const now = Date.now();
-      if (now - this.lastTriggerAt < this.cooldownMs) {
-        // Consume the match so the same bytes cannot fire again once the
-        // cooldown expires. A new quota error must be written to the log.
-        this.pending = '';
-        if (now - this.suppressedLoggedAt > this.cooldownMs) {
-          this.suppressedLoggedAt = now;
-          const remaining = Math.ceil((this.cooldownMs - (now - this.lastTriggerAt)) / 1000);
-          this.onLog?.(
-            'warn',
-            `log-guard cooldown active · trigger suppressed for ${remaining}s`,
-          );
-        }
-        return;
-      }
-
-      this.lastTriggerAt = now;
-      this.triggerCount += 1;
-      const matchLine =
-        combined
-          .split(/\r?\n/)
-          .find((line) => line.includes('QuotaExceeded')) || 'QuotaExceeded';
-
-      // The trigger has been handled; drop it from the carry buffer so a later
-      // unrelated line cannot replay this match after the cooldown.
-      this.pending = '';
-      this.onTrigger?.({
-        at: now,
-        count: this.triggerCount,
-        line: matchLine.trim().slice(0, 400),
-        file: this.filePath,
-      });
+      const targets = file ? [path.resolve(String(file))] : [...this.files.keys()];
+      for (const target of targets) await this.scanFile(target);
     } catch (error) {
       this.onLog?.('error', `log-guard scan failed: ${error.message}`);
     } finally {
@@ -577,7 +589,97 @@ class LogGuard {
     }
   }
 
+  async scanFile(file) {
+    const state = this.stateFor(file);
+    const stat = await fsp.stat(file).catch(() => null);
+    if (!stat) return;
+
+    if (stat.size < state.offset) {
+      state.offset = 0;
+      state.pending = '';
+    }
+    if (stat.size === state.offset) return;
+
+    // Read every new byte (chunked) instead of the last maxChunk only: a burst
+    // larger than one chunk used to hide the quota line in the middle.
+    const growth = stat.size - state.offset;
+    let cursor = state.offset;
+    if (growth > this.maxScanBytes) {
+      cursor = stat.size - this.maxScanBytes;
+      this.onLog?.(
+        'warn',
+        `log-guard burst in ${path.basename(file)} · skipped ${growth - this.maxScanBytes} of ${growth} new bytes`,
+      );
+    }
+
+    let text = '';
+    while (cursor < stat.size) {
+      const stop = Math.min(stat.size, cursor + this.maxChunk) - 1;
+      text += await readRange(file, cursor, stop);
+      cursor = stop + 1;
+    }
+    state.offset = stat.size;
+
+    const combined = state.pending + text;
+    state.pending = combined.slice(-64);
+
+    if (!QUOTA_PATTERN.test(combined)) return;
+
+    const matchLine = combined.split(/\r?\n/).find((line) => QUOTA_PATTERN.test(line)) || 'quota';
+    // The match is consumed here: once handled (now or deferred) it can never
+    // replay from the carry buffer on a later, unrelated write.
+    state.pending = '';
+
+    this.armTrigger({ line: matchLine.trim().slice(0, 400), file });
+  }
+
+  /**
+   * Cooldown delays a hop, it does not drop it: one deferred trigger runs as
+   * soon as the cooldown expires so back-to-back quota errors still burn the
+   * next /64 instead of vanishing.
+   */
+  armTrigger({ line, file }) {
+    const now = Date.now();
+    const wait = this.lastTriggerAt + this.cooldownMs - now;
+
+    if (wait > 0) {
+      if (!this.deferred) {
+        this.deferred = setTimeout(() => {
+          this.deferred = null;
+          this.fireTrigger({ line, file, deferred: true });
+        }, wait);
+        this.deferred.unref?.();
+        this.onLog?.(
+          'warn',
+          `log-guard cooldown active · hop deferred ${Math.ceil(wait / 1000)}s`,
+        );
+      } else if (now - this.suppressedLoggedAt > this.cooldownMs) {
+        this.suppressedLoggedAt = now;
+        this.onLog?.('warn', 'log-guard cooldown active · extra trigger folded into pending hop');
+      }
+      return;
+    }
+
+    this.fireTrigger({ line, file, deferred: false });
+  }
+
+  fireTrigger({ line, file, deferred }) {
+    this.lastTriggerAt = Date.now();
+    this.triggerCount += 1;
+    this.onTrigger?.({
+      at: this.lastTriggerAt,
+      count: this.triggerCount,
+      line,
+      file,
+      deferred,
+    });
+  }
+
   async stop() {
+    if (this.deferred) {
+      clearTimeout(this.deferred);
+      this.deferred = null;
+    }
     const watcher = this.watcher;
     this.watcher = null;
     if (watcher) await watcher.close().catch(() => {});
@@ -970,8 +1072,11 @@ class Deck {
     });
 
     this.guard = new LogGuard({
-      filePath: this.paths.clientLog,
+      filePaths: this.guardPaths(),
       cooldownMs: this.settings.guard.cooldownMs,
+      // Re-read one window on arm so a quota written seconds before the guard
+      // came up is still acted on, without re-hopping old history on restart.
+      lookbackMs: this.settings.guard.cooldownMs,
       onLog: (level, text) => this.log('guard', level, text),
       onTrigger: (info) => {
         this.handleGuardTrigger(info).catch((error) =>
@@ -1066,12 +1171,22 @@ class Deck {
       ...settings,
       poolDir: resolveDataPath(this.home, settings.poolDir),
       clientLogPath: resolveDataPath(this.home, settings.clientLogPath),
+      clientLogPaths: (settings.clientLogPaths || []).map((item) =>
+        resolveDataPath(this.home, item),
+      ),
       workspaceDir: resolveDataPath(this.home, settings.workspaceDir),
       engine: {
         ...settings.engine,
         command: resolveSettingPath(this.home, settings.engine.command),
       },
     };
+  }
+
+  /** Primary client log first, then any extra logs configured beside it. */
+  guardPaths() {
+    return [
+      ...new Set([this.paths.clientLog, ...(this.settings.clientLogPaths || [])].filter(Boolean)),
+    ];
   }
 
   async loadPersisted() {
@@ -1778,7 +1893,12 @@ class Deck {
     this.state.guard.lastTriggerAt = new Date(info.at).toISOString();
     this.state.guard.cooldownUntil = new Date(info.at + this.settings.guard.cooldownMs).toISOString();
 
-    this.log('guard', 'warn', `QuotaExceeded detected in client.log · ${info.line}`);
+    const where = info.file ? path.basename(info.file) : 'client.log';
+    this.log(
+      'guard',
+      'warn',
+      `${info.deferred ? 'deferred quota trigger fired' : 'quota trigger detected'} in ${where} · ${info.line}`,
+    );
 
     if (!this.state.toggles.logGuard) {
       this.log('guard', 'warn', 'log-guard is disabled · trigger ignored');
@@ -1787,18 +1907,18 @@ class Deck {
       return;
     }
     if (this.rotating) {
-      this.log('guard', 'warn', 'log-guard trigger ignored · rotation already in flight');
-      await this.savePersisted();
-      this.broadcast();
-      return;
-    }
-    if (!this.state.connected) {
-      this.log('guard', 'warn', 'log-guard detected trigger -> tunnel offline · hop skipped.');
+      // The hop already in flight lands on a config with fresh quota, so a
+      // quota line written mid-hop is satisfied by it. Counting it would
+      // double-count one exhaustion event.
+      this.log('guard', 'warn', 'log-guard trigger absorbed · rotation already in flight');
       await this.savePersisted();
       this.broadcast();
       return;
     }
 
+    // No `connected` short-circuit: rotate() already handles an offline
+    // tunnel by starting the next config, so dropping the trigger here would
+    // silently lose a real quota event.
     // Only triggers that actually caused a hop are counted, so the counter
     // reads as "quota events acted on", not "quota lines seen".
     this.state.guard.triggers += 1;
@@ -1942,7 +2062,12 @@ class Deck {
     if (this.guard.watching) return;
     await this.guard.start();
     this.state.guard.watching = true;
-    this.log('guard', 'info', `log-guard armed · watching ${this.paths.clientLog}`);
+    const files = this.guard.filePaths;
+    this.log(
+      'guard',
+      'info',
+      `log-guard armed · watching ${files.join(', ')}${files.length > 1 ? ` (${files.length} files)` : ''}`,
+    );
     this.broadcast();
   }
 
@@ -1950,7 +2075,7 @@ class Deck {
     if (!this.guard) return;
     await this.guard.stop();
     this.state.guard.watching = false;
-    this.log('guard', 'warn', 'log-guard disarmed · client.log no longer watched');
+    this.log('guard', 'warn', 'log-guard disarmed · client log no longer watched');
     this.broadcast();
   }
 
@@ -2119,7 +2244,7 @@ class Deck {
     this.settings.clientLogPath = this.paths.clientLog;
     this.state.paths.clientLog = this.paths.clientLog;
     this.state.guard.path = this.paths.clientLog;
-    if (this.guard) this.guard.filePath = this.paths.clientLog;
+    if (this.guard) await this.guard.setPaths(this.guardPaths());
     await this.writeSettings();
     if (this.state.toggles.logGuard) await this.startGuard();
     this.log('guard', 'info', `client log target updated · ${this.paths.clientLog}`);
@@ -2132,6 +2257,9 @@ class Deck {
       ...this.settings,
       poolDir: relativize(this.home, this.paths.pool),
       clientLogPath: relativize(this.home, this.paths.clientLog),
+      clientLogPaths: (this.settings.clientLogPaths || []).map((item) =>
+        relativize(this.home, item),
+      ),
       workspaceDir: relativize(this.home, this.paths.workspace),
       engine: {
         ...this.settings.engine,

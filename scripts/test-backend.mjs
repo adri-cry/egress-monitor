@@ -218,13 +218,13 @@ await test('nextEntry round-robins and wraps', () => {
   assert.equal(pool.nextEntry([{ name: 'only.conf' }], 'only.conf').name, 'only.conf');
 });
 
-await test('LogGuard fires on QuotaExceeded and enforces cooldown', async () => {
-  const logPath = path.join(root, 'client.log');
+await test('LogGuard fires on any quota-family line, not just QuotaExceeded', async () => {
+  const logPath = path.join(root, 'client-family.log');
   await fs.writeFile(logPath, 'boot\n');
   const triggers = [];
   const guard = new LogGuard({
     filePath: logPath,
-    cooldownMs: 700,
+    cooldownMs: 0,
     onTrigger: (info) => triggers.push(info),
     onLog: () => {},
   });
@@ -232,20 +232,141 @@ await test('LogGuard fires on QuotaExceeded and enforces cooldown', async () => 
   await guard.start();
   assert.equal(guard.watching, true);
 
-  await fs.appendFile(logPath, '2026-11-14 08:11:52 quota check failed: QuotaExceeded\n');
-  await waitFor(() => triggers.length === 1, 6000, 'first trigger');
-  assert.match(triggers[0].line, /QuotaExceeded/);
+  try {
+    await fs.appendFile(logPath, '2026-11-14 08:11:52 upstream denied: QuotaExceeded (429)\n');
+    await waitFor(() => triggers.length === 1, 6000, 'QuotaExceeded');
+    assert.match(triggers[0].line, /QuotaExceeded/);
 
-  await fs.appendFile(logPath, 'QuotaExceeded again\n');
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  assert.equal(triggers.length, 1, 'cooldown must suppress the second line');
+    await fs.appendFile(logPath, 'AI_APICallError: FreeUsageLimitError: free usage limit reached\n');
+    await waitFor(() => triggers.length === 2, 6000, 'FreeUsageLimitError');
 
-  await new Promise((resolve) => setTimeout(resolve, 400));
-  await fs.appendFile(logPath, 'still QuotaExceeded\n');
-  await waitFor(() => triggers.length === 2, 6000, 'second trigger after cooldown');
+    await fs.appendFile(logPath, 'error: quota exceeded\n');
+    await waitFor(() => triggers.length === 3, 6000, 'lowercase quota exceeded');
 
-  await guard.stop();
-  assert.equal(guard.watching, false);
+    await fs.appendFile(logPath, '{"error":{"type":"insufficient_quota"}}\n');
+    await waitFor(() => triggers.length === 4, 6000, 'insufficient_quota');
+
+    await fs.appendFile(logPath, 'HTTP 429 Too Many Requests\n');
+    await waitFor(() => triggers.length === 5, 6000, '429 Too Many Requests');
+
+    await fs.appendFile(logPath, 'rate limit exceeded, retrying in 30s\n');
+    await waitFor(() => triggers.length === 6, 6000, 'rate limit exceeded');
+
+    await fs.appendFile(logPath, 'harmless info line about capacity planning\n');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(triggers.length, 6, 'ordinary lines must not trigger');
+  } finally {
+    await guard.stop();
+  }
+});
+
+await test('LogGuard defers a quota line inside cooldown instead of dropping it', async () => {
+  const logPath = path.join(root, 'client-defer.log');
+  await fs.writeFile(logPath, 'boot\n');
+  const triggers = [];
+  const guard = new LogGuard({
+    filePath: logPath,
+    cooldownMs: 800,
+    onTrigger: (info) => triggers.push(info),
+    onLog: () => {},
+  });
+
+  await guard.start();
+  try {
+    await fs.appendFile(logPath, 'QuotaExceeded first\n');
+    await waitFor(() => triggers.length === 1, 6000, 'first trigger');
+
+    // Written inside the cooldown window: the hop must be delayed, not lost.
+    await fs.appendFile(logPath, 'QuotaExceeded second inside cooldown\n');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(triggers.length, 1, 'second trigger waits for the cooldown');
+
+    await waitFor(() => triggers.length === 2, 6000, 'deferred trigger fires');
+    assert.equal(triggers[1].deferred, true, 'deferred hop is flagged');
+    assert.match(triggers[1].line, /second inside cooldown/);
+
+    // Further quota lines fold into the single pending hop.
+    await fs.appendFile(logPath, 'QuotaExceeded third\n');
+    await fs.appendFile(logPath, 'QuotaExceeded fourth\n');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(triggers.length, 2, 'extra lines fold into the pending hop');
+  } finally {
+    await guard.stop();
+  }
+});
+
+await test('LogGuard reads every new byte in a burst larger than one chunk', async () => {
+  const logPath = path.join(root, 'client-burst.log');
+  await fs.writeFile(logPath, 'boot\n');
+  const triggers = [];
+  const guard = new LogGuard({
+    filePath: logPath,
+    cooldownMs: 0,
+    maxChunk: 256,
+    onTrigger: (info) => triggers.push(info),
+    onLog: () => {},
+  });
+
+  await guard.start();
+  try {
+    // Quota line lands at the start of a 4KB burst: a tail-only read misses it.
+    const filler = `${'noise '.repeat(60)}\n`.repeat(12);
+    await fs.appendFile(logPath, `QuotaExceeded early in burst\n${filler}`);
+    await waitFor(() => triggers.length === 1, 6000, 'quota inside a large burst');
+    assert.match(triggers[0].line, /early in burst/);
+  } finally {
+    await guard.stop();
+  }
+});
+
+await test('LogGuard watches extra log files and re-reads a fresh quota on arm', async () => {
+  const primary = path.join(root, 'client-primary.log');
+  const extra = path.join(root, 'client-extra.log');
+  await fs.writeFile(primary, 'boot\n');
+  await fs.writeFile(extra, 'QuotaExceeded written before the guard started\n');
+
+  const triggers = [];
+  const guard = new LogGuard({
+    filePaths: [primary, extra],
+    cooldownMs: 0,
+    lookbackMs: 60000,
+    onTrigger: (info) => triggers.push(info),
+    onLog: () => {},
+  });
+
+  await guard.start();
+  try {
+    assert.equal(guard.filePaths.length, 2);
+    await waitFor(() => triggers.length === 1, 6000, 'lookback trigger');
+    assert.equal(path.basename(triggers[0].file), 'client-extra.log');
+
+    await fs.appendFile(extra, 'QuotaExceeded fresh in the secondary file\n');
+    await waitFor(() => triggers.length === 2, 6000, 'secondary file trigger');
+    assert.match(triggers[1].line, /fresh in the secondary file/);
+  } finally {
+    await guard.stop();
+  }
+});
+
+await test('LogGuard does not re-hop on old history when armed without lookback', async () => {
+  const logPath = path.join(root, 'client-history.log');
+  await fs.writeFile(logPath, 'QuotaExceeded from a previous session\n');
+  const triggers = [];
+  const guard = new LogGuard({
+    filePath: logPath,
+    cooldownMs: 0,
+    lookbackMs: 0,
+    onTrigger: (info) => triggers.push(info),
+    onLog: () => {},
+  });
+
+  await guard.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(triggers.length, 0, 'arming at EOF must ignore existing history');
+  } finally {
+    await guard.stop();
+  }
 });
 
 await test('LogGuard does not replay a consumed trigger after cooldown', async () => {

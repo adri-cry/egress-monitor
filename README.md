@@ -2,7 +2,7 @@
 
 A local Windows control console for a pool of Cloudflare WARP WireGuard configs. It runs a userspace
 `sing-box` proxy on `127.0.0.1:41987`, rotates the egress IPv6 /64 on demand, and hops automatically
-when `client.log` reports `QuotaExceeded`.
+when a client log reports an exhausted quota.
 
 ![Egress Monitor console](screenshots/ui-1480.png)
 
@@ -17,9 +17,9 @@ React renderer (Tailwind) ── IPC ── preload bridge ── Electron main
                              ┌───────────────────────────┼──────────────────────────┐
                              │                           │                          │
                        ConfigPool                  EngineManager                LogGuard
-                  warp-configs/*.conf          sing-box child process       chokidar on client.log
+                  warp-configs/*.conf          sing-box child process      chokidar on client logs
                              │                           │                          │
-                             └──── render config ────────┘                    "QuotaExceeded"
+                             └──── render config ────────┘                    quota-family line
                                        runtime/sing-box.json                       │
                                                                                    ▼
                                                                               rotate /64
@@ -27,9 +27,11 @@ React renderer (Tailwind) ── IPC ── preload bridge ── Electron main
 
 A hop is:
 
-1. `LogGuard` reads only bytes appended to `client.log` after the guard was armed and finds
-   `QuotaExceeded`.
-2. Cooldown is checked (default 75 s), then rotation starts.
+1. `LogGuard` reads only bytes appended to the watched client logs after the guard was armed and looks
+   for a quota-family line (`QuotaExceeded`, `FreeUsageLimitError`, `insufficient_quota`, HTTP 429,
+   `rate limit exceeded`, …).
+2. Cooldown is checked (default 75 s); a quota line inside the window is deferred, not dropped, and
+   fires when the window closes.
 3. The next `.conf` in natural filename order is rendered into a sing-box config
    (`runtime/sing-box.json`). Private keys never leave the main process.
 4. The old engine is stopped (`taskkill /T /F`), the new one is spawned, and the app waits until
@@ -84,7 +86,7 @@ On first run the app creates `settings.json`, `logs\`, `runtime\`, and `workspac
 | `npm run build` | Production renderer build in `dist/` |
 | `npm start` | Build, then launch Electron |
 | `npm run engine:fetch` | Download `sing-box.exe` for this machine |
-| `npm run test:backend` | 21 backend checks (parsing, guard, engine, rotation) |
+| `npm run test:backend` | 25 backend checks (parsing, guard, engine, rotation) |
 | `npm run test:logbus` | Self-check for `LogBus.clear()` truncation |
 | `npm run preview` | Serve the built renderer in a browser (no IPC bridge) |
 
@@ -136,6 +138,7 @@ app after editing; pool and log folders can also be changed from the UI.
   },
   "poolDir": "warp-configs",
   "clientLogPath": "logs/client.log",
+  "clientLogPaths": [],
   "edge": { "host": "engage.cloudflareclient.com", "prefer": "ipv4" },
   "probe": {
     "urls": [
@@ -180,17 +183,26 @@ inventing numbers. Point `workspaceDir` at your client's data directory to show 
 ## Guard behaviour
 
 - The log file is created if missing and watched with chokidar (`awaitWriteFinish`, 200 ms).
-- The guard starts at EOF: pre-existing quota lines do not trigger a hop.
-- The first appended chunk containing `QuotaExceeded` triggers; repeats inside `guard.cooldownMs` are
-  suppressed and logged once per window.
-- The trigger only rotates while the tunnel is connected. When offline, the event is logged and the
-  hop is skipped.
-- Only triggers that actually cause a hop are counted; suppressed or skipped ones still appear in the
-  Guard log but leave `triggers` untouched.
+- Matching is a family, not one literal: `quota exceeded`, `freeusage` / `free usage limit`,
+  `insufficient_quota`, `rate limit`, and `too many requests` all trigger, case-insensitively. Clients
+  spell the same condition differently, so one exact string would miss real exhaustions.
+- On arm the guard starts at EOF. If the file was written within `guard.cooldownMs`, it re-reads the
+  last chunk so a quota line written moments before the guard armed is still acted on — without
+  re-hopping on old history.
+- Every new byte is read, not just the tail: a burst larger than one chunk (512 KB) is read in a loop,
+  capped at 4 MB per scan with a `log-guard burst` warning if the cap is hit.
+- A quota line inside `guard.cooldownMs` is deferred, not suppressed: exactly one hop is scheduled for
+  the moment the window closes, and further lines in the same window fold into that pending hop.
+- The guard rotates whether or not the tunnel is currently up: `rotate()` starts the next config, so a
+  trigger while offline is still a real quota event.
+- Only triggers that actually cause a hop are counted; ignored ones (guard off, hop already in flight)
+  appear in the Guard log but leave `triggers` untouched.
 - File truncation/rotation is handled by resetting the read offset.
 
-The watched file is `clientLogPath` (default `logs\client.log`). Point it at your client's real log by
-editing `settings.json` and restarting the console; the active path is always shown in the log footer.
+The watched files are `clientLogPath` (default `logs\client.log`) plus any extra paths in
+`clientLogPaths` — one entry per client that writes its own log. Both are relative to the deck home.
+Point them at your clients' real logs by editing `settings.json` or restarting the console; the active
+paths are always shown in the Guard log on arm.
 
 ## Keeper behaviour
 
@@ -214,9 +226,10 @@ npm run test:logbus
 ```
 
 The backend suite covers config parsing/validation, IPv6 /64 extraction, both sing-box render formats,
-pool sorting, the chokidar guard (including cooldown and no-replay-after-cooldown), log persistence and
-rotation, engine start/stop with a stub proxy engine, a missing-binary failure, and a full Deck rotation
-triggered by `QuotaExceeded` (asserting the exact success line plus the trigger and retired-/64 counters).
+pool sorting, the chokidar guard (quota-family matching, cooldown deferral, multi-file watch, lookback on
+arm, burst reads, no-replay-after-cooldown), log persistence and rotation, engine start/stop with a stub
+proxy engine, a missing-binary failure, and a full Deck rotation triggered by a quota line (asserting the
+exact success line plus the trigger and retired-/64 counters).
 
 `scripts/fixtures/fake-engine.mjs` is a SOCKS5 stand-in used only by tests.
 

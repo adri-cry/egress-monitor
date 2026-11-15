@@ -7,6 +7,7 @@
   },
   "poolDir": "warp-configs",
   "clientLogPath": "logs/client.log",
+  "clientLogPaths": [],
   "edge": { "host": "engage.cloudflareclient.com", "prefer": "ipv4" },
   "probe": {
     "urls": [
