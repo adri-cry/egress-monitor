@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { LogBus } from './electron/main.cjs';
+import { LogBus } from '../electron/main.cjs';
 
 const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'logbus-'));
 const bus = new LogBus({ dir });

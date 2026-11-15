@@ -41,6 +41,10 @@ A hop is:
    11-14 08:11:52 log-guard detected trigger -> rotating to config_04.conf -> success.
    ```
 
+   A listening port alone is not treated as success: if the probe fails the log says
+   `tunnel listening but egress unverified` and the status stays `DEGRADED`, because sing-box can bind
+   the inbound and still report `no route to internet`.
+
 ## Requirements
 
 - Windows 10/11
@@ -80,7 +84,8 @@ On first run the app creates `settings.json`, `logs\`, `runtime\`, and `workspac
 | `npm run build` | Production renderer build in `dist/` |
 | `npm start` | Build, then launch Electron |
 | `npm run engine:fetch` | Download `sing-box.exe` for this machine |
-| `npm run test:backend` | 13 backend checks (parsing, guard, engine, rotation) |
+| `npm run test:backend` | 21 backend checks (parsing, guard, engine, rotation) |
+| `npm run test:logbus` | Self-check for `LogBus.clear()` truncation |
 | `npm run preview` | Serve the built renderer in a browser (no IPC bridge) |
 
 ## Where the WireGuard configs go
@@ -180,6 +185,8 @@ inventing numbers. Point `workspaceDir` at your client's data directory to show 
   suppressed and logged once per window.
 - The trigger only rotates while the tunnel is connected. When offline, the event is logged and the
   hop is skipped.
+- Only triggers that actually cause a hop are counted; suppressed or skipped ones still appear in the
+  Guard log but leave `triggers` untouched.
 - File truncation/rotation is handled by resetting the read offset.
 
 The watched file is `clientLogPath` (default `logs\client.log`). Point it at your client's real log by
@@ -191,16 +198,21 @@ Every `keeper.intervalMs` the keeper checks that `127.0.0.1:41987` is listening.
 `failuresBeforeRestart` consecutive failures it rotates (or reconnects if it was offline). It also
 recovers automatically if the engine exits unexpectedly.
 
+The `retired /64` metric counts only configs burned by a quota trigger (`reason === 'log-guard'`).
+Operator and keeper hops move the hop counter but are not retirements, and an IPv4 egress has no /64
+to record — so a healthy IPv4-only WARP session legitimately reports `retired 0`.
+
 ## Verification
 
 ```powershell
 npm run test:backend
+npm run test:logbus
 ```
 
-The suite covers config parsing/validation, IPv6 /64 extraction, both sing-box render formats, pool
-sorting, the chokidar guard (including cooldown), log persistence, engine start/stop with a stub proxy
-engine, a missing-binary failure, and a full Deck rotation triggered by `QuotaExceeded` (asserting the
-exact success line).
+The backend suite covers config parsing/validation, IPv6 /64 extraction, both sing-box render formats,
+pool sorting, the chokidar guard (including cooldown and no-replay-after-cooldown), log persistence and
+rotation, engine start/stop with a stub proxy engine, a missing-binary failure, and a full Deck rotation
+triggered by `QuotaExceeded` (asserting the exact success line plus the trigger and retired-/64 counters).
 
 `scripts/fixtures/fake-engine.mjs` is a SOCKS5 stand-in used only by tests.
 
@@ -214,6 +226,7 @@ control-deck/
 │  └─ lib/pool.cjs        # WireGuard parsing + sing-box config rendering
 ├─ src/
 │  ├─ App.jsx             # Tailwind dashboard (header, actions, cards, controls, logs)
+│  ├─ ErrorBoundary.jsx   # keeps a renderer crash from blanking the window
 │  ├─ useDeck.js          # IPC state/log subscription + actions
 │  ├─ index.css           # Tailwind theme tokens and console surfaces
 │  └─ main.jsx
@@ -221,13 +234,13 @@ control-deck/
 │  ├─ dev.mjs             # Vite then Electron
 │  ├─ fetch-singbox.mjs   # engine installer
 │  ├─ test-backend.mjs    # backend test suite
+│  ├─ test-logbus.mjs     # LogBus.clear() self-check
 │  └─ fixtures/           # test-only SOCKS5 engine
-├─ engine/                # sing-box.exe lives here (gitignored)
+├─ engine/                # sing-box.exe + its GPL licence (gitignored)
 ├─ warp-configs/          # your .conf pool (gitignored)
 ├─ logs/                  # guard.log / keeper.log / app.log / client.log
 ├─ runtime/               # generated sing-box.json + persisted counters
 ├─ screenshots/
-├─ prototype/             # earlier simulated UI, retained for reference (not built)
 ├─ DESIGN.md
 └─ vite.config.js
 ```

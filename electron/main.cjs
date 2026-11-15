@@ -41,6 +41,7 @@ const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const SCREENSHOT_PATH = process.env.OCU_SCREENSHOT;
 const isScreenshotRun = Boolean(SCREENSHOT_PATH);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
+const DIST_DIR = path.join(PROJECT_ROOT, 'dist');
 
 const TOGGLE_IDS = ['keeper', 'logGuard', 'desktopProxy', 'autoStart'];
 const LOG_TABS = ['guard', 'keeper', 'app'];
@@ -1575,10 +1576,16 @@ class Deck {
       this.persisted.manualOffline = false;
       await this.probe({ compareDirect: this.settings.probe.compareDirect });
       await this.scanWorkspace();
+      // A live port is not proof of a working tunnel: sing-box can bind the
+      // inbound and still log "no route to internet". Only claim "tunnel up"
+      // when the egress probe actually came back verified.
+      const verified = this.state.egress.verified === true;
       this.log(
         'keeper',
-        'success',
-        `tunnel up · ${started.name} · ${Date.now() - startedAt}ms · proxy ${this.settings.proxy.host}:${this.settings.proxy.port}`,
+        verified ? 'success' : 'warn',
+        verified
+          ? `tunnel up · ${started.name} · ${Date.now() - startedAt}ms · proxy ${this.settings.proxy.host}:${this.settings.proxy.port}`
+          : `tunnel listening but egress unverified · ${started.name} · ${Date.now() - startedAt}ms · ${this.state.egress.error || 'probe failed'}`,
       );
       this.state.pool.currentFile = started.name;
       await this.savePersisted();
@@ -1670,9 +1677,11 @@ class Deck {
       await this.scanWorkspace();
 
       this.state.stats.hops += 1;
-      this.state.stats.blacklisted = previousBlock
-        ? this.state.stats.blacklisted + 1
-        : this.state.stats.blacklisted;
+      // A /64 is only "retired" when its quota was exhausted; keeper and manual
+      // hops are routine swaps. previousBlock is null on IPv4 egress, so key the
+      // counter off the trigger reason instead of the egress family.
+      const retired = reason === 'log-guard';
+      this.state.stats.blacklisted += retired ? 1 : 0;
       this.state.pool.currentFile = started.name;
 
       const elapsed = Date.now() - startedAt;
@@ -1680,13 +1689,17 @@ class Deck {
       this.log(
         'guard',
         'info',
-        `hop #${this.state.stats.hops} · ${previousBlock || 'no previous /64'} -> ${
+        `hop #${this.state.stats.hops} · ${previousBlock || this.state.egress.block64 || 'no previous /64'} -> ${
           this.state.egress.block64 || this.state.egress.ip || 'probe pending'
         } · ${elapsed}ms`,
       );
 
-      if (previousBlock && previousBlock !== this.state.egress.block64) {
-        this.log('guard', 'warn', `${previousBlock} retired · added to rotation blacklist`);
+      if (retired) {
+        this.log(
+          'guard',
+          'warn',
+          `${previousName || 'previous config'} retired · ${previousBlock || 'unknown egress'} burned by quota`,
+        );
       }
 
       await this.savePersisted();
@@ -1762,25 +1775,34 @@ class Deck {
   async handleGuardTrigger(info) {
     this.state.guard.lastTriggerAt = new Date(info.at).toISOString();
     this.state.guard.cooldownUntil = new Date(info.at + this.settings.guard.cooldownMs).toISOString();
-    this.state.guard.triggers += 1;
-    this.state.stats.triggers = this.state.guard.triggers;
-    await this.savePersisted();
-    this.broadcast();
 
     this.log('guard', 'warn', `QuotaExceeded detected in client.log · ${info.line}`);
 
     if (!this.state.toggles.logGuard) {
       this.log('guard', 'warn', 'log-guard is disabled · trigger ignored');
+      await this.savePersisted();
+      this.broadcast();
       return;
     }
     if (this.rotating) {
       this.log('guard', 'warn', 'log-guard trigger ignored · rotation already in flight');
+      await this.savePersisted();
+      this.broadcast();
       return;
     }
     if (!this.state.connected) {
       this.log('guard', 'warn', 'log-guard detected trigger -> tunnel offline · hop skipped.');
+      await this.savePersisted();
+      this.broadcast();
       return;
     }
+
+    // Only triggers that actually caused a hop are counted, so the counter
+    // reads as "quota events acted on", not "quota lines seen".
+    this.state.guard.triggers += 1;
+    this.state.stats.triggers = this.state.guard.triggers;
+    await this.savePersisted();
+    this.broadcast();
 
     const result = await this.rotate('log-guard');
     if (!result.ok) {
@@ -2174,7 +2196,11 @@ function createWindow() {
 
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
-    const allowed = DEV_URL ? targetUrl.startsWith(DEV_URL) : targetUrl.startsWith('file:');
+    // In production only the bundled renderer may be navigated to; a bare
+    // `file:` prefix would accept any local file, including attacker-dropped HTML.
+    const allowed = DEV_URL
+      ? targetUrl.startsWith(DEV_URL)
+      : targetUrl.startsWith(`file://${path.join(DIST_DIR, 'index.html')}`);
     if (!allowed) event.preventDefault();
   });
 

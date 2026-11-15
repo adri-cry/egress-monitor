@@ -581,6 +581,24 @@ await test('Deck rotates on a guard trigger and persists hops', async () => {
       file: path.join(home, 'logs', 'client.log'),
     });
     assert.equal(deck.state.stats.hops, 2);
+    assert.equal(deck.state.stats.triggers, 1, 'acted trigger counted');
+    assert.equal(deck.state.stats.blacklisted, 1, 'quota hop retires a /64');
+
+    // Routine hops must not inflate the retired-/64 counter.
+    const manual = await deck.rotate('manual');
+    assert.equal(manual.ok, true, manual.message);
+    assert.equal(deck.state.stats.blacklisted, 1, 'manual hop is not a retirement');
+
+    // A trigger the deck refuses to act on must not be counted either.
+    await deck.toggle('logGuard', false);
+    await deck.handleGuardTrigger({
+      at: Date.now(),
+      count: 1,
+      line: 'upstream denied request: QuotaExceeded (429)',
+      file: path.join(home, 'logs', 'client.log'),
+    });
+    assert.equal(deck.state.stats.triggers, 1, 'ignored trigger must not be counted');
+    assert.equal(deck.state.stats.hops, 3, 'ignored trigger must not hop');
 
     await deck.logs.flush();
     const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');

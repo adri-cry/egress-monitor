@@ -37,7 +37,7 @@ const TAB_META = [
 ];
 
 const STATUS_META = {
-  protected: { label: 'PROTECTED · WARP IPv6', tone: 'mint', Icon: ShieldCheck },
+  protected: { label: 'PROTECTED · WARP EGRESS', tone: 'mint', Icon: ShieldCheck },
   leaked: { label: 'LEAK DETECTED · EGRESS EXPOSED', tone: 'fault', Icon: ShieldAlert },
   rotating: { label: 'ROTATING · NEXT /64', tone: 'blue', Icon: RotateCw, spin: true },
   degraded: { label: 'DEGRADED · EGRESS UNVERIFIED', tone: 'amber', Icon: ShieldAlert },
@@ -188,9 +188,12 @@ function Titlebar({ desktop }) {
 
 function StatusPill({ status, connected, family }) {
   const meta = STATUS_META[status] || STATUS_META.idle;
+  // The protocol comes from the measured egress, never from a hardcoded label:
+  // WARP hands out IPv4 as often as IPv6, and the pill must not claim otherwise.
+  const protocol = family === 'ipv6' ? 'IPv6' : family === 'ipv4' ? 'IPv4' : 'EGRESS';
   const label =
-    connected && status === 'protected' && family !== 'ipv6'
-      ? 'PROTECTED · WARP EGRESS'
+    connected && status === 'protected'
+      ? `PROTECTED · WARP ${protocol}`
       : meta.label;
   const Icon = meta.Icon;
 
