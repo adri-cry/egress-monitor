@@ -287,11 +287,19 @@ await test('LogGuard defers a quota line inside cooldown instead of dropping it'
     assert.equal(triggers[1].deferred, true, 'deferred hop is flagged');
     assert.match(triggers[1].line, /second inside cooldown/);
 
-    // Further quota lines fold into the single pending hop.
+    // Further quota lines fold into the single pending hop (they must not each
+    // fire). Wall-clock dependent: if the cooldown already lapsed the first of
+    // these fires at once, so settle on the outcome instead of a fixed sleep.
     await fs.appendFile(logPath, 'QuotaExceeded third\n');
     await fs.appendFile(logPath, 'QuotaExceeded fourth\n');
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    assert.equal(triggers.length, 2, 'extra lines fold into the pending hop');
+    await waitFor(() => triggers.length >= 3, 6000, 'folded hop fires');
+    await new Promise((resolve) => setTimeout(resolve, 900)); // past another cooldown
+    assert.equal(triggers.length, 3, 'two extra lines fold into one hop, not two');
+    assert.match(
+      triggers[2].line,
+      /third|fourth/,
+      'the folded hop must carry one of the folded lines',
+    );
   } finally {
     await guard.stop();
   }

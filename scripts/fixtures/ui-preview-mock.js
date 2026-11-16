@@ -120,12 +120,15 @@
     lastError: null,
   };
 
-  const emit = () => listeners.forEach((listener) => listener({ ...state }));
+  // Deep copy on emit: React memoises on reference, and an in-place mutation
+  // would make the toggle counter look stuck in this preview (real IPC clones).
+  const snapshot = () => JSON.parse(JSON.stringify(state));
+  const emit = () => listeners.forEach((listener) => listener(snapshot()));
   const notify = (message, tone) => ({ ok: true, message, tone });
 
   window.deck = {
     isDesktop: true,
-    getState: async () => ({ state: { ...state }, logs }),
+    getState: async () => ({ state: snapshot(), logs: JSON.parse(JSON.stringify(logs)) }),
     onState: (listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);

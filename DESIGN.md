@@ -105,7 +105,7 @@ components:
 
 **Creative North Star: "The Fail-Closed Instrument Panel"**
 
-Egress Monitor is a desktop cockpit for a Windows operator who needs to know, in one glance, whether the protected network lane is up. The visual world is a blue-black instrument bay: layered graphite panels, hairline rails, monospaced measurements, and two signal colors with narrowly defined jobs. It is closer to a network operations console than to a SaaS dashboard.
+Egress Monitor is a desktop cockpit for an operator who needs to know, in one glance, whether the protected network lane is up. The visual world is a blue-black instrument bay: layered graphite panels, hairline rails, monospaced measurements, and two signal colors with narrowly defined jobs. It is closer to a network operations console than to a SaaS dashboard.
 
 The design is deliberately dense but quiet. Uppercase micro-labels establish the system taxonomy, while the actual proof points — IPv6 addresses, edge identity, last hop, and log receipts — are set larger in IBM Plex Mono. Electric blue identifies the application and structural actions; mint green is reserved for protection, successful hops, and the single primary action. The bright green primary bay and the protected status pill carry the strongest glows; status dots and switch thumbs use only a restrained internal glow.
 
@@ -159,7 +159,7 @@ Shapes are precise and machined. Panels use 9–10px radii; controls use 8px; me
 
 ## Components
 
-- **Title bar:** 36px custom strip with a draggable region, product/context identity, an engine-state indicator, and Windows minimize/maximize/close controls. The controls are disabled when the app is rendered outside Electron.
+- **Title bar:** 36px custom strip with a draggable region, product/context identity, an engine-state indicator, and minimize/maximize/close controls (rendered identically on Windows and Linux; disabled when the app is rendered outside Electron).
 - **Action bays:** four equal-height controls, 48px tall. The first two are outlined blue, the hop action is filled mint with a `HOP` keycap, and the WARP connection action is a dark neutral bay. Offline state disables the hop bay and renames the connection action to Reconnect WARP.
 - **Status cards:** fixed role order (public /64, proxy adapter, pinned edge, stats). Tags are compact outlined chips. The edge card pins the resolved AAAA; the stats card includes a hop telemetry rail and retired-prefix proof.
 - **Service rail:** four flexible rows with a 76px minimum height, each with icon, title, subtitle, optional state tag, ON/OFF label, and a 40×22 switch. The whole row remains readable when the switch is off; the switch turns grey while the receipt records the change.

@@ -9,7 +9,7 @@ web
 ## Stack
 
 Electron + React (Vite), TailwindCSS 4, sing-box as a supervised child process, chokidar for log
-watching. Windows-first desktop shell with a sandboxed preload bridge.
+watching. Cross-platform desktop shell (Windows + Linux) with a sandboxed preload bridge.
 
 ## Users
 
@@ -33,7 +33,7 @@ windows and config files.
 
 ## Operating Context
 
-Windows desktop; a local pool of WARP `.conf` files; a client app or CLI that writes `client.log`; a
+Windows/Linux desktop; a local pool of WARP `.conf` files; a client app or CLI that writes `client.log`; a
 local proxy on 127.0.0.1:41987; periodic quota responses during long client sessions; frequent short
 check-ins while coding.
 
@@ -48,14 +48,14 @@ check-ins while coding.
 - Proxy Keeper polls the local port and restarts or rotates after consecutive failures; the engine is
   recovered after an unexpected exit.
 - Toggles: Proxy Keeper, Log Guard, Desktop App Proxy (per-process proxy env injection), Auto-Start
-  (Windows login item). All are real actions, persisted across runs.
+  (Windows login item / Linux XDG autostart entry). All are real actions, persisted across runs.
 - Four actions: Launch App, Launch CLI, Rotate /64 Now, Connect/Disconnect. Launch targets come from
   `settings.json`; nothing else is spawned.
 - Status cards show the proxied public /64, engine/adapter state, resolved edge AAAA, hops, retired
   prefixes, and workspace project/chat counts.
-- Constraints: Windows-first; sing-box must be installed; a client executable must be configured for
-  Launch App; system-wide proxy changes are intentionally not made; stats show `—` when the workspace
-  folders are absent.
+- Constraints: Windows 10/11 + Linux (Mint 22 tested); sing-box must be installed; a client executable
+  must be configured for Launch App; system-wide proxy changes are intentionally not made; stats show `—`
+  when the workspace folders are absent.
 
 ## Brand Commitments
 

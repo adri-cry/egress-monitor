@@ -26,9 +26,9 @@ back to the legacy WireGuard `outbound` format.
 
 ## Notes
 
-- `sing-box.exe` is gitignored.
+- `sing-box.exe` / `sing-box` is gitignored.
 - Engine stdout/stderr is forwarded to the App Log tab.
-- The engine binds a `mixed` inbound to `127.0.0.1:41987`; it does not install a Windows service or
-  change system routing, so no elevation is required.
+- The engine binds a `mixed` inbound to `127.0.0.1:41987`; it does not install a system service or
+  change system routing, so no elevation (administrator/root) is required.
 - If another proxy already owns the port, the engine exits with a bind error and the console reports
   it in the App Log.

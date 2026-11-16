@@ -65,7 +65,7 @@ Windows (PowerShell):
 ```powershell
 cd control-deck
 npm install
-npm run engine:fetch          # downloads sing-box.exe into engine\
+npm run engine:fetch          # downloads sing-box.exe into engine/
 # copy your WARP configs into warp-configs\config_01.conf … config_04.conf
 npm run dev                   # Vite + Electron with hot reload
 ```
