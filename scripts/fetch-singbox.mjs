@@ -16,32 +16,34 @@ import { fileURLToPath } from 'node:url';
 const execFileAsync = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const engineDir = path.join(root, 'engine');
-const target = path.join(engineDir, 'sing-box.exe');
 
 const force = process.argv.includes('--force');
 const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
 const version = process.env.SINGBOX_VERSION || null;
 
+/** Release asset platform token: windows / linux / darwin. */
+const osToken =
+  process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux';
+const binaryName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+const target = path.join(engineDir, binaryName);
+
 async function githubJson(url) {
-  const response = await fetch(url, {
-    headers: {
-      'user-agent': 'egress-monitor-installer',
-      accept: 'application/vnd.github+json',
-    },
-  });
+  const headers = {
+    'user-agent': 'egress-monitor-installer',
+    accept: 'application/vnd.github+json',
+  };
+  // Unauthenticated GitHub API allows 60 requests/hour per IP; a token lifts that.
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const response = await fetch(url, { headers });
   if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
   return response.json();
 }
 
 async function main() {
-  if (process.platform !== 'win32') {
-    throw new Error('This installer targets Windows. Install sing-box with your package manager instead.');
-  }
-
   if (!force) {
     try {
       await fs.access(target);
-      console.log(`engine/sing-box.exe already exists — use --force to replace it.`);
+      console.log(`engine/${binaryName} already exists — use --force to replace it.`);
       return;
     } catch {
       /* not installed yet */
@@ -52,10 +54,11 @@ async function main() {
     ? await githubJson(`https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${version}`)
     : await githubJson('https://api.github.com/repos/SagerNet/sing-box/releases/latest');
 
+  const suffix = (name) => name.endsWith(`${osToken}-${arch}.zip`) || name.endsWith(`${osToken}-${arch}.tar.gz`);
   const asset = (release.assets || []).find(
-    (item) => item.name.endsWith(`windows-${arch}.zip`) && item.name.startsWith('sing-box-'),
+    (item) => item.name.startsWith('sing-box-') && suffix(item.name),
   );
-  if (!asset) throw new Error(`No windows-${arch} zip in release ${release.tag_name}`);
+  if (!asset) throw new Error(`No ${osToken}-${arch} archive in release ${release.tag_name}`);
 
   console.log(`Downloading ${asset.name} (${release.tag_name})…`);
   const download = await fetch(asset.browser_download_url, {
@@ -71,7 +74,10 @@ async function main() {
   console.log('Extracting…');
   try {
     await execFileAsync('tar', ['-xf', zipPath, '-C', unpackDir], { windowsHide: true });
-  } catch {
+  } catch (error) {
+    if (process.platform !== 'win32') {
+      throw new Error(`could not extract the release archive with tar: ${error.message}`);
+    }
     // Some Windows shells block tar.exe; fall back to PowerShell.
     const quote = (value) => `'${String(value).replace(/'/g, "''")}'`;
     await execFileAsync(
@@ -93,13 +99,14 @@ async function main() {
     for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) stack.push(full);
-      else if (entry.name.toLowerCase() === 'sing-box.exe') exe = full;
+      else if (entry.name.toLowerCase() === binaryName) exe = full;
     }
   }
-  if (!exe) throw new Error('sing-box.exe was not found in the release archive');
+  if (!exe) throw new Error(`${binaryName} was not found in the release archive`);
 
   await fs.mkdir(engineDir, { recursive: true });
   await fs.copyFile(exe, target);
+  if (process.platform !== 'win32') await fs.chmod(target, 0o755);
 
   await fs.rm(zipPath, { force: true }).catch(() => {});
   await fs.rm(unpackDir, { recursive: true, force: true }).catch(() => {});

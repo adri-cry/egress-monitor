@@ -25,8 +25,10 @@ const {
   canConnect,
   desktopProxyArgs,
   normalizeSettings,
+  setLinuxAutostart,
   stamp,
   stripAnsi,
+  whichSync,
 } = require('../electron/main.cjs');
 
 const scratch = process.env.TMPDIR || path.join(os.tmpdir());
@@ -466,9 +468,10 @@ await test('LogBus strips ANSI escapes and rotates oversized tab files', async (
 });
 
 await test('normalizeSettings survives null and mistyped settings.json', async () => {
+  const isWin = process.platform === 'win32';
   const defaults = normalizeSettings(null);
   assert.equal(defaults.proxy.port, 41987);
-  assert.equal(defaults.engine.command, 'engine/sing-box.exe');
+  assert.equal(defaults.engine.command, isWin ? 'engine/sing-box.exe' : 'engine/sing-box');
   assert.equal(defaults.probe.urls.length, 3);
   assert.match(defaults.probe.urls[0], /api6\./, 'IPv6 probe must run first or /64 rotation stays invisible');
   assert.equal(defaults.logs.maxBytes, 2 * 1024 * 1024);
@@ -480,7 +483,7 @@ await test('normalizeSettings survives null and mistyped settings.json', async (
     logs: null,
   });
   assert.equal(coerced.proxy.host, '127.0.0.1');
-  assert.equal(coerced.client.cli.command, 'powershell.exe');
+  assert.equal(coerced.client.cli.command, isWin ? 'powershell.exe' : '');
   assert.equal(coerced.logs.maxBytes, 2 * 1024 * 1024);
 
   const guarded = normalizeSettings({
@@ -626,7 +629,7 @@ await test('EngineManager starts the proxy port and stops the child', async () =
 await test('EngineManager reports ENGINE_MISSING for a missing binary', async () => {
   const home = path.join(root, 'missing-home');
   const engine = new EngineManager({
-    command: path.join(home, 'does-not-exist.exe'),
+    command: path.join(home, process.platform === 'win32' ? 'does-not-exist.exe' : 'does-not-exist'),
     home,
     port: 43198,
     configPath: path.join(home, 'runtime', 'sing-box.json'),
@@ -732,6 +735,20 @@ await test('Deck rotates on a guard trigger and persists hops', async () => {
   } finally {
     await deck.dispose();
   }
+});
+
+await test('linux launcher helpers: XDG autostart file and PATH lookup', async () => {
+  const entry = path.join(root, 'autostart', 'egress-monitor.desktop');
+  assert.equal(await setLinuxAutostart(true, entry), true);
+  const text = await fs.readFile(entry, 'utf8');
+  assert.match(text, /^\[Desktop Entry\]/);
+  assert.match(text, /^Type=Application$/m);
+  assert.match(text, /^Exec=.+/m, 'Exec must name the Electron binary');
+  assert.equal(await setLinuxAutostart(false, entry), false);
+  assert.equal(fssync.existsSync(entry), false);
+
+  assert.ok(whichSync(process.platform === 'win32' ? 'node.exe' : 'node'), 'node must resolve from PATH');
+  assert.equal(whichSync('definitely-not-a-real-binary-xyz'), null);
 });
 
 await fs.rm(root, { recursive: true, force: true }).catch(() => {});

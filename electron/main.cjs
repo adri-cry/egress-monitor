@@ -46,6 +46,55 @@ const DIST_DIR = path.join(PROJECT_ROOT, 'dist');
 const TOGGLE_IDS = ['keeper', 'logGuard', 'desktopProxy', 'autoStart'];
 const LOG_TABS = ['guard', 'keeper', 'app'];
 
+const IS_WIN = process.platform === 'win32';
+const IS_LINUX = process.platform === 'linux';
+const ENGINE_BIN = IS_WIN ? 'sing-box.exe' : 'sing-box';
+const DEFAULT_ENGINE_COMMAND = `engine/${ENGINE_BIN}`;
+
+/**
+ * Terminals that accept "run this command" args, in the order Mint editions
+ * ship them (Cinnamon, MATE, XFCE, then generic). Each entry appends the full
+ * argv, so `-e`/`-x` receive `bash -lc <script>` as separate arguments.
+ */
+const LINUX_TERMINALS = [
+  { command: 'gnome-terminal', prefix: ['--'] },
+  { command: 'mate-terminal', prefix: ['-x'] },
+  { command: 'xfce4-terminal', prefix: ['-x'] },
+  { command: 'konsole', prefix: ['-e'] },
+  { command: 'xterm', prefix: ['-e'] },
+];
+
+/** XDG autostart entry — Electron's setLoginItemSettings is Windows/macOS only. */
+function linuxAutostartPath() {
+  return path.join(os.homedir(), '.config', 'autostart', 'egress-monitor.desktop');
+}
+
+/** Write or remove the XDG autostart entry. Returns the state that actually landed. */
+async function setLinuxAutostart(enabled, file = linuxAutostartPath()) {
+  if (!enabled) {
+    await fsp.rm(file, { force: true }).catch(() => {});
+    return false;
+  }
+
+  const exec = [process.execPath, ...(app?.isPackaged ? [] : [PROJECT_ROOT])]
+    .map((part) => (/[\s"'\\]/.test(part) ? `"${part.replace(/(["\\])/g, '\\$1')}"` : part))
+    .join(' ');
+  const entry = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Name=Egress Monitor',
+    'Comment=WARP egress rotator and monitor',
+    `Exec=${exec}`,
+    'Terminal=false',
+    'X-GNOME-Autostart-enabled=true',
+    '',
+  ].join('\n');
+
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.writeFile(file, entry, 'utf8');
+  return fssync.existsSync(file);
+}
+
 let mainWindow = null;
 let deck = null;
 
@@ -95,6 +144,23 @@ function resolveDataPath(home, value) {
   const expanded = expandHome(String(value || ''));
   if (!expanded) return expanded;
   return path.isAbsolute(expanded) ? expanded : path.resolve(home, expanded);
+}
+
+/** Synchronous PATH lookup so the launch click can decide before spawning. */
+function whichSync(name) {
+  if (!name) return null;
+  if (path.isAbsolute(name)) return fssync.existsSync(name) ? name : null;
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try {
+      fssync.accessSync(candidate, fssync.constants.X_OK);
+      return candidate;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
 }
 
 function canConnect(host, port, timeoutMs = 900) {
@@ -168,11 +234,26 @@ class EngineError extends Error {
 // settings
 // ---------------------------------------------------------------------------
 
+/** CLI client default: a PowerShell window on Windows, a detected terminal on Linux. */
+function defaultCliClient() {
+  if (!IS_WIN) return { command: '', args: [], cwd: '' };
+  return {
+    command: 'powershell.exe',
+    args: [
+      '-NoLogo',
+      '-NoExit',
+      '-Command',
+      "$env:HTTPS_PROXY='http://127.0.0.1:41987'; $env:HTTP_PROXY=$env:HTTPS_PROXY; $env:ALL_PROXY=$env:HTTPS_PROXY; Write-Host ('Egress proxy wired: ' + $env:HTTPS_PROXY)",
+    ],
+    cwd: '',
+  };
+}
+
 function defaultSettings() {
   return {
     proxy: { host: '127.0.0.1', port: 41987 },
     engine: {
-      command: 'engine/sing-box.exe',
+      command: DEFAULT_ENGINE_COMMAND,
       args: [],
       timeoutMs: 15000,
     },
@@ -199,16 +280,7 @@ function defaultSettings() {
     logs: { maxBytes: 2 * 1024 * 1024 },
     client: {
       desktop: { command: '', args: [], cwd: '' },
-      cli: {
-        command: 'powershell.exe',
-        args: [
-          '-NoLogo',
-          '-NoExit',
-          '-Command',
-          "$env:HTTPS_PROXY='http://127.0.0.1:41987'; $env:HTTP_PROXY=$env:HTTPS_PROXY; $env:ALL_PROXY=$env:HTTPS_PROXY; Write-Host ('Egress proxy wired: ' + $env:HTTPS_PROXY)",
-        ],
-        cwd: '',
-      },
+      cli: defaultCliClient(),
     },
     workspaceDir: 'workspace',
     autoConnect: true,
@@ -778,7 +850,7 @@ class EngineManager {
     if (!command) {
       throw new EngineError(
         'ENGINE_MISSING',
-        `sing-box not found at "${this.command}". Drop sing-box.exe into engine/ or run "npm run engine:fetch".`,
+        `sing-box not found at "${this.command}". Drop ${ENGINE_BIN} into engine/ or run "npm run engine:fetch".`,
       );
     }
 
@@ -1056,6 +1128,9 @@ class Deck {
         this.state.toggles.autoStart = app.getLoginItemSettings().openAtLogin;
       } catch {
         /* not supported on this platform */
+      }
+      if (IS_LINUX) {
+        this.state.toggles.autoStart = fssync.existsSync(linuxAutostartPath());
       }
     }
 
@@ -2105,15 +2180,28 @@ class Deck {
       );
     } else if (id === 'autoStart') {
       if (app) {
-        const args = app.isPackaged ? [] : [PROJECT_ROOT];
-        app.setLoginItemSettings({ openAtLogin: next, path: process.execPath, args });
-        const actual = app.getLoginItemSettings().openAtLogin;
-        this.state.toggles.autoStart = actual;
-        this.log(
-          'app',
-          actual === next ? 'success' : 'warn',
-          `auto-start ${actual ? 'enabled' : 'disabled'} · ${actual ? 'launches at Windows sign-in' : 'login item removed'}`,
-        );
+        if (IS_LINUX) {
+          this.state.toggles.autoStart = await setLinuxAutostart(next);
+          this.log(
+            'app',
+            this.state.toggles.autoStart === next ? 'success' : 'warn',
+            `auto-start ${next ? 'enabled' : 'disabled'} · ${
+              next ? linuxAutostartPath() : 'XDG autostart entry removed'
+            }`,
+          );
+        } else {
+          const args = app.isPackaged ? [] : [PROJECT_ROOT];
+          app.setLoginItemSettings({ openAtLogin: next, path: process.execPath, args });
+          const actual = app.getLoginItemSettings().openAtLogin;
+          this.state.toggles.autoStart = actual;
+          this.log(
+            'app',
+            actual === next ? 'success' : 'warn',
+            `auto-start ${actual ? 'enabled' : 'disabled'} · ${
+              actual ? `launches at ${IS_WIN ? 'Windows sign-in' : 'login'}` : 'login item removed'
+            }`,
+          );
+        }
       }
     }
 
@@ -2127,7 +2215,33 @@ class Deck {
     const client = this.settings.client[kind];
     const label = kind === 'desktop' ? 'Client Desktop' : 'Client CLI';
 
-    if (!client?.command) {
+    let command = client?.command;
+    let baseArgs = [...(client?.args || [])];
+
+    // Linux has no single CLI host: pick the first terminal that exists and
+    // hand it `bash -lc <proxy export + $SHELL>`. An explicit command wins.
+    if (kind === 'cli' && !command && IS_LINUX) {
+      const terminal = LINUX_TERMINALS.map((item) => ({
+        ...item,
+        path: whichSync(item.command),
+      })).find((item) => item.path);
+      if (!terminal) {
+        const message = 'Client CLI is not configured and no terminal was found. Set client.cli.command in settings.json.';
+        this.log('app', 'error', `launch failed · ${message}`);
+        return { ok: false, message };
+      }
+      const proxyUrl = `http://${this.settings.proxy.host}:${this.settings.proxy.port}`;
+      command = terminal.path;
+      baseArgs = [
+        ...terminal.prefix,
+        'bash',
+        '-lc',
+        `export HTTP_PROXY=${proxyUrl} HTTPS_PROXY=${proxyUrl} ALL_PROXY=${proxyUrl} ` +
+          `NO_PROXY=localhost,127.0.0.1,::1; echo "Egress proxy wired: ${proxyUrl}"; exec "$SHELL"`,
+      ];
+    }
+
+    if (!command) {
       const message = `${label} is not configured. Set client.${kind}.command in settings.json.`;
       this.log('app', 'error', `launch failed · ${message}`);
       return { ok: false, message };
@@ -2143,10 +2257,10 @@ class Deck {
       env.NO_PROXY = 'localhost,127.0.0.1,::1';
     }
 
-    const cwd = client.cwd ? resolveSettingPath(this.home, client.cwd) : this.home;
+    const cwd = client?.cwd ? resolveSettingPath(this.home, client.cwd) : this.home;
     const args =
-      kind === 'desktop' ? desktopProxyArgs(client.args, proxyEnabled) : [...(client.args || [])];
-    if (kind === 'desktop' && !proxyEnabled && args.length !== (client.args || []).length) {
+      kind === 'desktop' ? desktopProxyArgs(baseArgs, proxyEnabled) : [...baseArgs];
+    if (kind === 'desktop' && !proxyEnabled && args.length !== baseArgs.length) {
       this.log(
         'app',
         'warn',
@@ -2478,6 +2592,8 @@ module.exports = {
   defaultSettings,
   desktopProxyArgs,
   normalizeSettings,
+  setLinuxAutostart,
   stamp,
   stripAnsi,
+  whichSync,
 };

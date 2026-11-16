@@ -18,5 +18,6 @@ warp-configs/*.conf
 
 # downloaded engine binaries (never commit ~90MB of binaries)
 engine/*.exe
+engine/sing-box
 electron/*.exe
 electron/*.dll

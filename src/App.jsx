@@ -889,7 +889,7 @@ export default function App() {
                 <ToggleRow
                   icon={Power}
                   title="Auto-Start"
-                  description="Registers the console as a Windows sign-in item for the operator account."
+                  description="Registers the console as a login item for the operator account (Windows sign-in / XDG autostart)."
                   tag={toggles.autoStart ? 'ENABLED' : ''}
                   enabled={Boolean(toggles.autoStart)}
                   onToggle={(next) => setToggle('autoStart', next)}

@@ -1,8 +1,9 @@
 # Egress Rotator & Monitor
 
-A local Windows control console for a pool of Cloudflare WARP WireGuard configs. It runs a userspace
-`sing-box` proxy on `127.0.0.1:41987`, rotates the egress IPv6 /64 on demand, and hops automatically
-when a client log reports an exhausted quota.
+A local control console for a pool of Cloudflare WARP WireGuard configs, running on Windows 10/11 and
+Linux (developed against Linux Mint 22). It runs a userspace `sing-box` proxy on `127.0.0.1:41987`,
+rotates the egress IPv6 /64 on demand, and hops automatically when a client log reports an exhausted
+quota.
 
 ![Egress Monitor console](screenshots/ui-1480.png)
 
@@ -34,8 +35,8 @@ A hop is:
    fires when the window closes.
 3. The next `.conf` in natural filename order is rendered into a sing-box config
    (`runtime/sing-box.json`). Private keys never leave the main process.
-4. The old engine is stopped (`taskkill /T /F`), the new one is spawned, and the app waits until
-   `127.0.0.1:41987` accepts connections.
+4. The old engine is stopped (`taskkill /T /F` on Windows, `SIGTERM` then `SIGKILL` on Linux/macOS),
+   the new one is spawned, and the app waits until `127.0.0.1:41987` accepts connections.
 5. Egress is probed through the SOCKS5 proxy, the new /64 is recorded, hops/blacklist counters move,
    and the receipt is written to the Guard log:
 
@@ -49,7 +50,7 @@ A hop is:
 
 ## Requirements
 
-- Windows 10/11
+- Windows 10/11, or Linux (Mint/Ubuntu/Debian — tested on Mint 22)
 - Node.js 22+ and npm
 - `sing-box` 1.10 or newer (1.11+ preferred; the renderer detects the version and falls back to the
   legacy outbound format)
@@ -59,6 +60,8 @@ No administrator rights are needed: sing-box runs in userspace and exposes a loc
 
 ## Quick start
 
+Windows (PowerShell):
+
 ```powershell
 cd control-deck
 npm install
@@ -67,16 +70,32 @@ npm run engine:fetch          # downloads sing-box.exe into engine\
 npm run dev                   # Vite + Electron with hot reload
 ```
 
-Or double-click **`Buka Egress Monitor.bat`** in the project folder to build and launch the desktop
-window directly.
+Linux (Mint 22 / Ubuntu 24.04+):
+
+```bash
+cd control-deck
+npm install
+npm run engine:fetch          # downloads the linux-amd64 sing-box into engine/
+# copy your WARP configs into warp-configs/config_01.conf … config_04.conf
+npm run dev                   # Vite + Electron with hot reload
+```
+
+Or double-click **`Buka Egress Monitor.bat`** (Windows) / run **`./launch-egress-monitor.sh`** (Linux)
+to build and launch the desktop window directly. On Ubuntu 24.04 / Mint 22 Electron's sandbox helper
+ships non-setuid; the Linux launcher detects the AppArmor restriction and falls back to `--no-sandbox`,
+printing the permanent `chown root:root … && chmod 4755 chromium-sandbox` fix.
 
 Production-style launch:
 
-```powershell
-npm start                     # builds the renderer, then opens Electron from dist\
+```bash
+npm start                     # builds the renderer, then opens Electron from dist/
 ```
 
-On first run the app creates `settings.json`, `logs\`, `runtime\`, and `workspace\`.
+On first run the app creates `settings.json`, `logs/`, `runtime/`, and `workspace/`.
+
+Linux desktop integration (optional, via the Auto-Start toggle): the app writes
+`~/.config/autostart/egress-monitor.desktop`. On Windows it uses the registry login item. No root
+needed in either case.
 
 ### Scripts
 
@@ -85,17 +104,17 @@ On first run the app creates `settings.json`, `logs\`, `runtime\`, and `workspac
 | `npm run dev` | Vite dev server + Electron |
 | `npm run build` | Production renderer build in `dist/` |
 | `npm start` | Build, then launch Electron |
-| `npm run engine:fetch` | Download `sing-box.exe` for this machine |
+| `npm run engine:fetch` | Download the `sing-box` binary for this OS/arch into `engine/` |
 | `npm run test:backend` | 25 backend checks (parsing, guard, engine, rotation) |
 | `npm run test:logbus` | Self-check for `LogBus.clear()` truncation |
 | `npm run preview` | Serve the built renderer in a browser (no IPC bridge) |
 
 ## Where the WireGuard configs go
 
-Put the `.conf` files in the pool directory — by default `control-deck\warp-configs\`:
+Put the `.conf` files in the pool directory — by default `control-deck/warp-configs/`:
 
 ```text
-warp-configs\
+warp-configs/
   config_01.conf
   config_02.conf
   config_03.conf
@@ -132,7 +151,7 @@ app after editing; pool and log folders can also be changed from the UI.
 {
   "proxy": { "host": "127.0.0.1", "port": 41987 },
   "engine": {
-    "command": "engine/sing-box.exe",
+    "command": "engine/sing-box",
     "args": [],
     "timeoutMs": 15000
   },
@@ -153,10 +172,7 @@ app after editing; pool and log folders can also be changed from the UI.
   "keeper": { "intervalMs": 10000, "failuresBeforeRestart": 2, "heartbeatLogMs": 90000 },
   "client": {
     "desktop": { "command": "", "args": [], "cwd": "" },
-    "cli": {
-      "command": "powershell.exe",
-      "args": ["-NoLogo", "-NoExit", "-Command", "..."]
-    }
+    "cli": { "command": "", "args": [], "cwd": "" }
   },
   "workspaceDir": "workspace",
   "autoConnect": true
@@ -167,12 +183,15 @@ app after editing; pool and log folders can also be changed from the UI.
 
 Launch actions read `client.desktop` and `client.cli`; nothing else is spawned from the renderer.
 
-- `client.desktop.command` is empty by default. Set it to your client executable, e.g.
-  `"C:\\Program Files\\Client\\Client.exe"`, with optional `args` and `cwd`.
-- `client.cli` defaults to a PowerShell window with `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`
-  pointed at `127.0.0.1:41987`.
+- `client.desktop.command` is empty by default. Set it to your client executable
+  (`"C:\\Program Files\\Client\\Client.exe"` on Windows, `/usr/bin/code` on Linux), with optional
+  `args` and `cwd`.
+- `client.cli` is platform-detected when left empty: Windows opens PowerShell with `HTTP_PROXY`,
+  `HTTPS_PROXY`, and `ALL_PROXY` pointed at `127.0.0.1:41987`; Linux opens the first available
+  terminal (`gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `konsole`, `xterm`) running
+  `bash -lc` with the same exports, then your `$SHELL`. Set `command`/`args` to override.
 - When **Desktop App Proxy** is on, both launches receive those proxy variables. This is per-process;
-  it does not rewrite the system-wide Windows proxy.
+  it does not rewrite the system-wide OS proxy.
 
 ### Stats card
 
@@ -220,7 +239,7 @@ behind an IPv4 address. Keep the IPv6 probe first if you reorder `probe.urls`.
 
 ## Verification
 
-```powershell
+```bash
 npm run test:backend
 npm run test:logbus
 ```
@@ -253,7 +272,7 @@ control-deck/
 │  ├─ test-backend.mjs    # backend test suite
 │  ├─ test-logbus.mjs     # LogBus.clear() self-check
 │  └─ fixtures/           # test-only SOCKS5 engine
-├─ engine/                # sing-box.exe + its GPL licence (gitignored)
+├─ engine/                # sing-box binary + its GPL licence (gitignored)
 ├─ warp-configs/          # your .conf pool (gitignored)
 ├─ logs/                  # guard.log / keeper.log / app.log / client.log
 ├─ runtime/               # generated sing-box.json + persisted counters
@@ -266,7 +285,7 @@ control-deck/
 
 | Symptom | Fix |
 | --- | --- |
-| `ENGINE MISSING` pill | Run `npm run engine:fetch`, or set `engine.command` to an existing `sing-box.exe`. |
+| `ENGINE MISSING` pill | Run `npm run engine:fetch`, or set `engine.command` to an existing `sing-box` binary. |
 | `CONFIG POOL EMPTY` | Add `.conf` files to `warp-configs/`; check the App log for rejected files. |
 | `DEGRADED · EGRESS UNVERIFIED` | The engine is up but the probe URL failed. Check `probe.urls`, DNS, and the App log. The tunnel may still work. |
 | Proxy reachable but app ignores it | The app must honour `HTTP(S)_PROXY` or launch through **Launch CLI**. Updating the system-wide proxy is intentionally not done. |

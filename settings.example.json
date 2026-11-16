@@ -1,7 +1,7 @@
 {
   "proxy": { "host": "127.0.0.1", "port": 41987 },
   "engine": {
-    "command": "engine/sing-box.exe",
+    "command": "engine/sing-box",
     "args": [],
     "timeoutMs": 15000
   },
@@ -31,13 +31,8 @@
       "cwd": ""
     },
     "cli": {
-      "command": "powershell.exe",
-      "args": [
-        "-NoLogo",
-        "-NoExit",
-        "-Command",
-        "$env:HTTPS_PROXY='http://127.0.0.1:41987'; $env:HTTP_PROXY=$env:HTTPS_PROXY; $env:ALL_PROXY=$env:HTTPS_PROXY; Write-Host ('Egress proxy wired: ' + $env:HTTPS_PROXY)"
-      ],
+      "command": "",
+      "args": [],
       "cwd": ""
     }
   },
