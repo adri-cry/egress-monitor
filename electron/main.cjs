@@ -702,7 +702,46 @@ class LogGuard {
     // replay from the carry buffer on a later, unrelated write.
     state.pending = '';
 
-    this.armTrigger({ line: matchLine.trim().slice(0, 400), file });
+    // opencode logs `timestamp=2026-...Z level=ERROR ...`. The time the error
+    // actually happened must win over the time we happened to notice it —
+    // otherwise an old line re-read after a refresh looks like a fresh hop.
+    const loggedAtOf = (line) => {
+      const found = line.match(
+        /timestamp\s*=\s*"?([^\s"]+)"?|\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s"]*)/i,
+      );
+      return found ? Date.parse(found[1] || found[2]) : NaN;
+    };
+    const now = Date.now();
+    let freshLine = null;
+    let freshAt = NaN;
+    let staleLine = null;
+    for (const line of combined.split(/\r?\n/).filter((item) => QUOTA_PATTERN.test(item))) {
+      const at = loggedAtOf(line);
+      if (Number.isFinite(at) && now - at > this.lookbackMs) {
+        staleLine ??= line;
+        continue;
+      }
+      freshLine = line;
+      freshAt = at;
+      break;
+    }
+
+    if (!freshLine) {
+      const at = loggedAtOf(staleLine || matchLine);
+      this.onLog?.(
+        'warn',
+        `log-guard ignored stale quota line · logged ${
+          Number.isFinite(at) ? new Date(at).toISOString() : 'unknown'
+        } (${Number.isFinite(at) ? Math.round((now - at) / 60000) : '?'}m old)`,
+      );
+      return;
+    }
+
+    this.armTrigger({
+      line: freshLine.trim().slice(0, 400),
+      file,
+      at: Number.isFinite(freshAt) ? freshAt : now,
+    });
   }
 
   /**
@@ -710,7 +749,7 @@ class LogGuard {
    * soon as the cooldown expires so back-to-back quota errors still burn the
    * next /64 instead of vanishing.
    */
-  armTrigger({ line, file }) {
+  armTrigger({ line, file, at = Date.now() }) {
     const now = Date.now();
     const wait = this.lastTriggerAt + this.cooldownMs - now;
 
@@ -718,7 +757,7 @@ class LogGuard {
       if (!this.deferred) {
         this.deferred = setTimeout(() => {
           this.deferred = null;
-          this.fireTrigger({ line, file, deferred: true });
+          this.fireTrigger({ line, file, deferred: true, at });
         }, wait);
         this.deferred.unref?.();
         this.onLog?.(
@@ -732,14 +771,16 @@ class LogGuard {
       return;
     }
 
-    this.fireTrigger({ line, file, deferred: false });
+    this.fireTrigger({ line, file, deferred: false, at });
   }
 
-  fireTrigger({ line, file, deferred }) {
-    this.lastTriggerAt = Date.now();
+  fireTrigger({ line, file, deferred, at }) {
+    const detectedAt = Date.now();
+    this.lastTriggerAt = detectedAt;
     this.triggerCount += 1;
     this.onTrigger?.({
-      at: this.lastTriggerAt,
+      at: at ?? detectedAt,
+      detectedAt,
       count: this.triggerCount,
       line,
       file,
@@ -1007,6 +1048,9 @@ class Deck {
       blacklisted: 0,
       currentConfig: null,
       manualOffline: false,
+      burntBlocks: [],
+      failedHops: 0,
+      lastOkHop: 0,
       toggles: { keeper: true, logGuard: true, desktopProxy: true, autoStart: false },
     };
 
@@ -1023,6 +1067,8 @@ class Deck {
     this.keeperTimer = null;
     this.keeperBusy = false;
     this.keeperFailures = 0;
+    this.egressFailures = 0;
+    this.backoffUntil = 0;
     this.lastHeartbeatLog = 0;
     this.workspaceCache = { at: 0, projects: null, chats: null };
     this.proxySession = null;
@@ -1283,6 +1329,9 @@ class Deck {
     this.persisted.hops = this.state.stats.hops;
     this.persisted.triggers = this.state.guard.triggers;
     this.persisted.blacklisted = this.state.stats.blacklisted;
+    this.persisted.burntBlocks = Array.isArray(this.persisted.burntBlocks)
+      ? this.persisted.burntBlocks.slice(-200)
+      : [];
     this.persisted.currentConfig = this.currentEntry?.name ?? this.state.pool.currentFile;
     this.persisted.toggles = { ...this.state.toggles };
 
@@ -1694,7 +1743,7 @@ class Deck {
    * config cannot start. A single expired/blackholed config must not trap the
    * keeper in a connect-fail loop.
    */
-  async startAnyEntry(preferredName = null, { attempts = 3, onAttempt = null } = {}) {
+  async startAnyEntry(preferredName = null, { attempts = 3, onAttempt = null, verify = null } = {}) {
     const total = Math.min(attempts, this.pool.entries.length);
     let entry =
       this.pool.entries.find((item) => item.name === preferredName) ??
@@ -1713,6 +1762,21 @@ class Deck {
       tried.add(entry.name);
       try {
         await this.startEntry(entry);
+        // A bound port is not proof of a usable tunnel: some WARP /64s route
+        // nothing at all. Probe before committing to the config.
+        if (verify) {
+          const ok = await verify(entry);
+          if (!ok) {
+            // The config was started and probed but not accepted: the live
+            // tunnel is already this config's. Drop the stale egress so a later
+            // rotation compares against this config rather than the one that
+            // was live before the hop.
+            this.state.egress = { ...this.state.egress, verified: false };
+            throw Object.assign(new Error('egress probe failed · config has no working tunnel'), {
+              code: 'EGRESS_UNVERIFIED',
+            });
+          }
+        }
         return entry;
       } catch (error) {
         lastError = error;
@@ -1757,6 +1821,7 @@ class Deck {
     try {
       const started = await this.startAnyEntry(preferredName, {
         attempts: 3,
+        verify: async () => (await this.probe({ compareDirect: this.settings.probe.compareDirect })).verified,
         onAttempt: (entry, error) =>
           this.log(
             'keeper',
@@ -1766,7 +1831,6 @@ class Deck {
       });
       this.state.connected = true;
       this.persisted.manualOffline = false;
-      await this.probe({ compareDirect: this.settings.probe.compareDirect });
       await this.scanWorkspace();
       // A live port is not proof of a working tunnel: sing-box can bind the
       // inbound and still log "no route to internet". Only claim "tunnel up"
@@ -1824,6 +1888,45 @@ class Deck {
     return { ok: true, message: 'Tunnel disconnected.' };
   }
 
+  /**
+   * Hop retries a bounded number of times. A single hop can legitimately fail
+   * (a reused/burnt /64, a blackholed config), so the pool is walked once more
+   * before giving up; a fresh console start still starts from `currentConfig`.
+   */
+  static HOP_ATTEMPTS = 2;
+
+  async rotateOnce(reason, previousName, previous, burnt) {
+    const firstCandidate = nextEntry(this.pool.entries, previousName);
+    return this.startAnyEntry(firstCandidate?.name ?? null, {
+      attempts: Math.min(3, this.pool.entries.length),
+      verify: async (entry) => {
+        const egress = await this.probe({
+          compareDirect: this.settings.probe.compareDirect,
+        });
+        if (!egress.verified) return false;
+        // A bound port with a reused /64 is not a fresh hop: the upstream
+        // quota follows the /64, so keep trying other configs. Compare the
+        // probed block against the egress captured before this hop, not the
+        // live state (probe() has already overwritten it by now).
+        const block = egress.block64 ? ipv6Block64(egress.block64) : null;
+        if (!block) return true; // IPv4 egress: no /64 to compare
+        const old = previous.block64 ? ipv6Block64(previous.block64) : null;
+        if (old && block === old) {
+          this.log('guard', 'warn', `${reason} -> ${entry.name} reused /64 ${block} · trying next config`);
+          return false;
+        }
+        if (burnt.has(block)) {
+          this.log('guard', 'warn', `${reason} -> ${entry.name} hit burnt /64 ${block} · trying next config`);
+          return false;
+        }
+        this.persisted.burntBlocks = [...new Set([...burnt, block])];
+        return true;
+      },
+      onAttempt: (entry, error) =>
+        this.log('guard', 'error', `${reason} -> rotating to ${entry.name} -> failed: ${error.message}`),
+    });
+  }
+
   async rotate(reason = 'manual') {
     if (this.rotating) return { ok: false, message: 'Rotation already in progress.' };
     if (!this.pool.entries.length) {
@@ -1848,27 +1951,67 @@ class Deck {
 
     const startedAt = Date.now();
     const previousName = this.currentEntry?.name ?? null;
-    const previousBlock = this.state.egress.block64;
+    // Capture the egress before startAnyEntry(): it stops and restarts the
+    // engine, which drops the live tunnel, so any later probe reports the new
+    // config's /64 and the previous one would be lost.
+    const previous = this.state.egress
+      ? {
+          ip: this.state.egress.ip ?? null,
+          family: this.state.egress.family ?? null,
+          block64: this.state.egress.block64 ?? null,
+          subnet64: this.state.egress.subnet64 ?? null,
+        }
+      : { ip: null, family: null, block64: null, subnet64: null };
+    const previousBlock = previous.block64;
+    const burnt = new Set(
+      (Array.isArray(this.persisted.burntBlocks) ? this.persisted.burntBlocks : [])
+        .map((item) => ipv6Block64(item))
+        .filter(Boolean),
+    );
+    if (reason === 'log-guard' && previousBlock) {
+      const key = ipv6Block64(previousBlock);
+      if (key && !burnt.has(key)) {
+        burnt.add(key);
+        this.persisted.burntBlocks = [...burnt];
+      }
+    }
 
-    const firstCandidate = nextEntry(this.pool.entries, previousName);
     let started = null;
 
     try {
-      started = await this.startAnyEntry(firstCandidate?.name ?? null, {
-        attempts: 3,
-        onAttempt: (entry, error) =>
-          this.log(
-            'guard',
-            'error',
-            `${label} -> rotating to ${entry.name} -> failed: ${error.message}`,
-          ),
-      });
+      let lastError = null;
+      for (let attempt = 0; attempt < Deck.HOP_ATTEMPTS; attempt += 1) {
+        try {
+          started = await this.rotateOnce(label, previousName, previous, burnt);
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt + 1 < Deck.HOP_ATTEMPTS) {
+            this.log(
+              'guard',
+              'warn',
+              `${label} -> pool pass ${attempt + 1} found no fresh /64 · retrying once`,
+            );
+          }
+        }
+      }
+      if (!started) {
+        // Do not lose the retirement: the /64 that just hit the quota wall must
+        // stay blacklisted even when no fresh config could be started.
+        if (reason === 'log-guard' && previousBlock) {
+          const key = ipv6Block64(previousBlock);
+          if (key) this.persisted.burntBlocks = [...new Set([...burnt, key])];
+        }
+        throw lastError || new Error('no config could be started');
+      }
 
       this.state.connected = true;
-      await this.probe({ compareDirect: this.settings.probe.compareDirect });
       await this.scanWorkspace();
 
       this.state.stats.hops += 1;
+      this.persisted.lastOkHop = Date.now();
+      this.persisted.failedHops = 0;
+      this.backoffUntil = 0;
       // A /64 is only "retired" when its quota was exhausted; keeper and manual
       // hops are routine swaps. previousBlock is null on IPv4 egress, so key the
       // counter off the trigger reason instead of the egress family.
@@ -1965,14 +2108,17 @@ class Deck {
   }
 
   async handleGuardTrigger(info) {
+    const detectedAt = info.detectedAt ?? info.at;
     this.state.guard.lastTriggerAt = new Date(info.at).toISOString();
-    this.state.guard.cooldownUntil = new Date(info.at + this.settings.guard.cooldownMs).toISOString();
+    this.state.guard.cooldownUntil = new Date(
+      detectedAt + this.settings.guard.cooldownMs,
+    ).toISOString();
 
     const where = info.file ? path.basename(info.file) : 'client.log';
     this.log(
       'guard',
       'warn',
-      `${info.deferred ? 'deferred quota trigger fired' : 'quota trigger detected'} in ${where} · ${info.line}`,
+      `${info.deferred ? 'deferred quota trigger fired' : 'quota trigger detected'} in ${where} · logged ${stamp(new Date(info.at))} · seen ${stamp(new Date(detectedAt))} · ${info.line}`,
     );
 
     if (!this.state.toggles.logGuard) {
@@ -1989,6 +2135,43 @@ class Deck {
       await this.savePersisted();
       this.broadcast();
       return;
+    }
+
+    // Loop protection: if a fresh /64 hits the wall again almost immediately,
+    // the address did not help. Pause auto-rotation briefly instead of burning
+    // through the whole config pool in a minute.
+    const now = Date.now();
+    const REWALL_MS = 3 * 60 * 1000;
+    const BACKOFF_MS = 2 * 60 * 1000;
+    const FAILED_HOPS_MAX = 2;
+    if (now < this.backoffUntil) {
+      this.log(
+        'guard',
+        'warn',
+        `quota wall repeating on fresh /64 · auto-rotation paused ~${Math.ceil((this.backoffUntil - now) / 60000)}m`,
+      );
+      await this.savePersisted();
+      this.broadcast();
+      return;
+    }
+    const lastOkHop = Number(this.persisted.lastOkHop || 0);
+    if (lastOkHop && now - lastOkHop <= REWALL_MS) {
+      this.persisted.failedHops = Number(this.persisted.failedHops || 0) + 1;
+      this.log(
+        'guard',
+        'warn',
+        `wall returned ${Math.round((now - lastOkHop) / 1000)}s after a fresh /64 (${this.persisted.failedHops}/${FAILED_HOPS_MAX})`,
+      );
+      if (this.persisted.failedHops >= FAILED_HOPS_MAX) {
+        this.backoffUntil = now + BACKOFF_MS;
+        this.persisted.failedHops = 0;
+        this.log('guard', 'warn', `pausing auto-rotation for ${BACKOFF_MS / 60000} min — new /64s keep hitting the wall`);
+      }
+      await this.savePersisted();
+      this.broadcast();
+      if (this.backoffUntil) return;
+    } else if (lastOkHop) {
+      this.persisted.failedHops = 0;
     }
 
     // No `connected` short-circuit: rotate() already handles an offline
@@ -2102,13 +2285,24 @@ class Deck {
                 `egress recheck · proxy and direct IP still match (${egress.ip})`,
               );
             } else if (egress.verified) {
+              this.egressFailures = 0;
               this.log(
                 'keeper',
                 'info',
                 `egress recheck · ${egress.ip} · ${egress.family || 'unknown'}`,
               );
             } else {
-              this.log('keeper', 'warn', `egress recheck failed · ${egress.error}`);
+              this.egressFailures += 1;
+              this.log(
+                'keeper',
+                'warn',
+                `egress recheck failed · ${egress.error} (${this.egressFailures}/${this.settings.keeper.failuresBeforeRestart})`,
+              );
+              if (this.egressFailures >= this.settings.keeper.failuresBeforeRestart) {
+                this.egressFailures = 0;
+                this.log('keeper', 'warn', 'egress still unverified · rotating to another /64');
+                await this.rotate('keeper');
+              }
             }
           }
         }

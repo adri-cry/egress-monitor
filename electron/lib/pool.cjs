@@ -340,10 +340,30 @@ function renderSingBoxConfig(conf, options = {}) {
     listen_port: listenPort,
   };
 
+  // Resolve probe/domain names inside the tunnel. Without this sing-box falls
+  // back to the host resolver (systemd-resolved / Tailscale MagicDNS), which
+  // hands back Cloudflare anycast IPs that are unreachable from the WARP exit
+  // -> "connect tcp ... operation timed out" and endless probe failures.
+  const dns = {
+    servers: [
+      { tag: 'warp-dns', type: 'https', server: '1.1.1.1', detour: 'warp' },
+      { tag: 'local-dns', type: 'local' },
+    ],
+    rules: [
+      {
+        domain_suffix: ['.local', '.ts.net', 'localhost'],
+        action: 'route',
+        server: 'local-dns',
+      },
+      { action: 'route', server: 'warp-dns' },
+    ],
+  };
+
   if (format === 'outbound') {
     return {
       log: { level: 'warn', timestamp: true },
       inbounds: [inbound],
+      dns,
       outbounds: [
         { type: 'direct', tag: 'direct' },
         {
@@ -361,6 +381,7 @@ function renderSingBoxConfig(conf, options = {}) {
       ],
       route: {
         auto_detect_interface: true,
+        default_domain_resolver: 'warp-dns',
         rules: directRules(),
         final: 'warp',
       },
@@ -370,6 +391,7 @@ function renderSingBoxConfig(conf, options = {}) {
   return {
     log: { level: 'warn', timestamp: true },
     inbounds: [inbound],
+    dns,
     outbounds: [{ type: 'direct', tag: 'direct' }],
     endpoints: [
       {
@@ -394,6 +416,7 @@ function renderSingBoxConfig(conf, options = {}) {
     ],
     route: {
       auto_detect_interface: true,
+      default_domain_resolver: 'warp-dns',
       rules: directRules(),
       final: 'warp',
     },

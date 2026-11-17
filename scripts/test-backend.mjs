@@ -560,7 +560,7 @@ await test('Deck falls back to the next config when connect cannot start it', as
       if (entry.name === 'config_01.conf') throw new Error('handshake failed');
       deck.currentEntry = entry;
     };
-    deck.probe = async () => deck.state.egress;
+    deck.probe = async () => ({ ...deck.state.egress, verified: true });
     deck.scanWorkspace = async () => deck.workspaceCache;
 
     const result = await deck.connect('manual');
@@ -740,6 +740,77 @@ await test('Deck rotates on a guard trigger and persists hops', async () => {
       /log-guard detected trigger -> rotating to config_0\d\.conf -> success\./,
     );
     assert.doesNotMatch(JSON.stringify(deck.publicState()), /PrivateKey|privateKey/);
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('rotate refuses to land on the previous or a burnt /64', async () => {
+  const home = await makeDeckHome('deck-burnt');
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+
+    // The live tunnel is config_01's /64. The next config happens to route out
+    // of the very same /64 (the hop #7 failure in the field): it must be
+    // rejected rather than counted as a fresh hop.
+    deck.state.egress = {
+      ip: '2a09:bac5:3a12:25b9::1',
+      family: 'ipv6',
+      block64: '2a09:bac5:3a12:25b9::/64',
+      subnet64: '2a09:bac5:3a12:25b9',
+      verified: true,
+      leaked: false,
+      directIp: null,
+      checkedAt: new Date().toISOString(),
+      error: null,
+    };
+    deck.persisted.burntBlocks = ['2a09:bac1:34c0:28::/64'];
+    deck.currentEntry = deck.pool.entries[0];
+
+    const seen = [];
+    deck.probe = async () => {
+      seen.push(deck.currentEntry.name);
+      return {
+        ip: '2a09:bac5:3a12:25b9::1',
+        family: 'ipv6',
+        block64: '2a09:bac5:3a12:25b9::/64',
+        subnet64: '2a09:bac5:3a12:25b9',
+        verified: true,
+        leaked: false,
+        directIp: null,
+        checkedAt: new Date().toISOString(),
+        error: null,
+      };
+    };
+
+    const result = await deck.rotate('log-guard');
+    assert.equal(result.ok, false, 'a hop back onto the same /64 must fail');
+    assert.equal(deck.state.stats.hops, 0, 'no hop is counted when the /64 is unchanged');
+    assert.equal(deck.state.stats.blacklisted, 0, 'no /64 is retired when the hop failed');
+    // The pool is walked once per attempt, so the same-/64 config is retried
+    // across the whole pool rather than accepted on the first try.
+    assert.equal(
+      seen.length,
+      deck.pool.entries.length * Deck.HOP_ATTEMPTS,
+      'every config is tried in both pool passes before giving up',
+    );
+
+    // The retired /64 survives a failed rotation.
+    assert.ok(
+      deck.persisted.burntBlocks.includes('2a09:bac5:3a12:25b9::/64'),
+      'the quota-exhausted /64 stays blacklisted',
+    );
+
+    await deck.logs.flush();
+    const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');
+    assert.match(guardLog, /reused \/64/, 'the refusal is logged');
   } finally {
     await deck.dispose();
   }
