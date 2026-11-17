@@ -10,7 +10,7 @@ MENU="Tampilkan UI!bash -c 'cd /home/rootx/Documents/egress-monitor && ./node_mo
 Rotate /64!systemctl --user restart egress-monitor.service
 Status!bash -c 'curl -sS -m 8 --socks5-hostname 127.0.0.1:41987 https://api6.ipify.org?format=json | xargs -0 notify-send Egress'
 Buka Log!bash -c 'gnome-terminal -- bash -c \"tail -f /home/rootx/Documents/egress-monitor/logs/guard.log\"'
-Keluar!bash -c 'systemctl --user stop egress-tray.service egress-monitor.service'"
+Keluar (Quit)!bash -c 'systemctl --user stop egress-tray.service egress-monitor.service'"
 
 yad --notification \
   --image="$ICON" \

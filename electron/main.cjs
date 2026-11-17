@@ -2794,6 +2794,8 @@ if (app && !hasLock) {
   });
   // systemd mengirim SIGTERM saat `systemctl stop` — ini harus tetap mematikan.
   process.on('SIGTERM', shutdown);
+  // Quit dari UI/tray: jalurkan shutdown yang sama (dispose engine dulu, lalu quit).
+  ipcMain.on('window:quit', shutdown);
 }
 
 process.on('uncaughtException', (error) => {

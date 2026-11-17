@@ -178,6 +178,9 @@ function Titlebar({ desktop }) {
         <WindowButton label="Maximize" onClick={() => bridge?.window?.toggleMaximize()}>
           <Square className="h-3 w-3" strokeWidth={2} />
         </WindowButton>
+        <WindowButton label="Quit" danger onClick={() => bridge?.window?.quit()}>
+          <Power className="h-3.5 w-3.5" strokeWidth={2} />
+        </WindowButton>
         <WindowButton label="Close" danger onClick={() => bridge?.window?.close()}>
           <X className="h-3.5 w-3.5" strokeWidth={2} />
         </WindowButton>

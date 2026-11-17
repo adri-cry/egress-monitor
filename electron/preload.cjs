@@ -36,6 +36,7 @@ contextBridge.exposeInMainWorld('deck', {
     minimize: () => ipcRenderer.send('window:minimize'),
     toggleMaximize: () => ipcRenderer.send('window:toggle-maximize'),
     close: () => ipcRenderer.send('window:close'),
+    quit: () => ipcRenderer.send('window:quit'),
     onMaximizedChange: (callback) => subscribe('window:maximized-state', callback),
   },
 });
