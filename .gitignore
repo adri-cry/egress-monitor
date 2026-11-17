@@ -12,6 +12,9 @@ runtime/
 logs/
 workspace/
 
+# local backup of removed files (9router helper, not part of the project)
+.backup-removed/
+
 # never commit WireGuard private keys
 warp-configs/*.conf
 !warp-configs/*.example

@@ -40,6 +40,11 @@ const execFileAsync = promisify(execFile);
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const SCREENSHOT_PATH = process.env.OCU_SCREENSHOT;
 const isScreenshotRun = Boolean(SCREENSHOT_PATH);
+// EGRESS_HIDDEN=1 -> jalankan sebagai background service: window dibuat tapi
+// tidak ditampilkan. Ikon tray diurus oleh tray.sh (yad), bukan Electron Tray.
+const isHidden = ['1', 'true', 'yes'].includes(
+  String(process.env.EGRESS_HIDDEN || '').toLowerCase(),
+);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(PROJECT_ROOT, 'dist');
 
@@ -2620,7 +2625,7 @@ function createWindow() {
   mainWindow.setMenuBarVisibility(false);
 
   mainWindow.once('ready-to-show', () => {
-    if (!isScreenshotRun) mainWindow.show();
+    if (!isScreenshotRun && !isHidden) mainWindow.show();
   });
   mainWindow.on('maximize', () => {
     mainWindow?.webContents.send('window:maximized-state', true);
@@ -2731,8 +2736,19 @@ if (app && !hasLock) {
   app.quit();
 } else if (app) {
   app.on('second-instance', () => {
-    if (!mainWindow) return;
+    // Kalau window sudah ditutup (mainWindow=null), buat lagi dari deck yang
+    // tetap hidup di background.
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      const win = createWindow();
+      win.webContents.on('did-finish-load', () => deck?.broadcast());
+      win.show();
+      win.focus();
+      return;
+    }
     if (mainWindow.isMinimized()) mainWindow.restore();
+    // Kalau instance pertama jalan hidden (background service), tunjukkan
+    // window-nya supaya bisa dipakai seperti biasa.
+    if (isHidden || !mainWindow.isVisible()) mainWindow.show();
     mainWindow.focus();
   });
 
@@ -2751,18 +2767,33 @@ if (app && !hasLock) {
   });
 
   app.on('window-all-closed', () => {
+    // Dalam mode background (hidden), menutup window TIDAK boleh mematikan
+    // aplikasi — proxy harus tetap jalan. UI dibuka kembali lewat tray.
+    if (isHidden) return;
     if (process.platform !== 'darwin') app.quit();
   });
 
   let quitting = false;
-  app.on('before-quit', (event) => {
+  const shutdown = () => {
     if (quitting) return;
-    event.preventDefault();
     quitting = true;
     Promise.resolve(deck?.dispose())
       .catch(() => {})
       .finally(() => app.quit());
+  };
+  app.on('before-quit', (event) => {
+    if (quitting) return;
+    // Di mode hidden, abaikan quit yang dipicu sistem (mis. session cleanup/
+    // window-all-closed). Yang sah: SIGTERM dari systemctl stop, atau tray Keluar.
+    if (isHidden) {
+      event.preventDefault();
+      return;
+    }
+    event.preventDefault();
+    shutdown();
   });
+  // systemd mengirim SIGTERM saat `systemctl stop` — ini harus tetap mematikan.
+  process.on('SIGTERM', shutdown);
 }
 
 process.on('uncaughtException', (error) => {
