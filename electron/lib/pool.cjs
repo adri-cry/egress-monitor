@@ -355,6 +355,16 @@ function renderSingBoxConfig(conf, options = {}) {
         action: 'route',
         server: 'local-dns',
       },
+      {
+        // WARP's IPv4 egress is a shared anycast address that does not change
+        // between configs; only the IPv6 /64 rotates. Resolve the inference
+        // host over IPv6 so the client's traffic leaves through the rotated
+        // /64 instead of the constant IPv4 address.
+        domain_suffix: ['opencode.ai'],
+        action: 'route',
+        server: 'warp-dns',
+        strategy: 'prefer_ipv6',
+      },
       { action: 'route', server: 'warp-dns' },
     ],
   };

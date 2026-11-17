@@ -192,6 +192,26 @@ await test('renderSingBoxConfig produces endpoints + outbound formats', () => {
   for (const rule of legacy.route.rules) {
     assert.ok(legacyTags.has(rule.outbound), `route references missing outbound ${rule.outbound}`);
   }
+
+  // WARP's IPv4 egress is a shared anycast address that never changes between
+  // configs; only the IPv6 /64 rotates. The inference host must resolve over
+  // IPv6 or every hop keeps leaving through the same blocked IPv4 address.
+  for (const [name, config] of [
+    ['endpoints', endpoints],
+    ['outbound', legacy],
+  ]) {
+    const rule = config.dns.rules.find((item) =>
+      (item.domain_suffix || []).includes('opencode.ai'),
+    );
+    assert.ok(rule, `${name}: opencode.ai DNS rule missing`);
+    assert.equal(rule.server, 'warp-dns', `${name}: opencode.ai must use warp-dns`);
+    assert.equal(rule.strategy, 'prefer_ipv6', `${name}: opencode.ai must prefer IPv6`);
+    assert.equal(
+      config.route.domain_strategy,
+      undefined,
+      `${name}: route.domain_strategy is rejected by sing-box 1.14`,
+    );
+  }
 });
 
 await test('scanPool sorts naturally and reports rejected files', async () => {
