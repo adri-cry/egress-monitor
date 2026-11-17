@@ -93,6 +93,33 @@ npm start                     # builds the renderer, then opens Electron from di
 
 On first run the app creates `settings.json`, `logs/`, `runtime/`, and `workspace/`.
 
+### Headless / background service (Linux)
+
+The app can run without a window, with a panel tray icon for control. On Cinnamon/Linux the
+tray is provided by `tray.sh` (yad AppIndicator); Electron's own `Tray` is not used because it
+does not register with some StatusNotifier-based panels.
+
+```bash
+# one-time: install the tray helper
+sudo apt install yad
+
+# user systemd units (auto-start on login)
+#   egress-monitor.service  -> EGRESS_HIDDEN=1 electron . --no-sandbox
+#   egress-tray.service     -> tray.sh (panel icon)
+systemctl --user enable --now egress-monitor.service egress-tray.service
+
+# verify
+systemctl --user status egress-monitor.service egress-tray.service
+curl -sS --socks5-hostname 127.0.0.1:41987 'https://api.ipify.org?format=json'
+```
+
+With `EGRESS_HIDDEN=1` the window is created but never shown, and closing it does **not** quit the
+app — the proxy keeps running. Open the UI on demand with `tray` (left-click the icon) or by
+running `electron .` again (the `second-instance` handler shows/recreates the window). Shutdown is
+only via `systemctl stop egress-monitor.service` (SIGTERM) or the tray's **Keluar** menu item.
+
+The tray menu offers: show UI, rotate /64 now, check current egress IP, tail the Guard log, quit.
+
 Linux desktop integration (optional, via the Auto-Start toggle): the app writes
 `~/.config/autostart/egress-monitor.desktop`. On Windows it uses the registry login item. No root
 needed in either case.
@@ -108,6 +135,8 @@ needed in either case.
 | `npm run test:backend` | 25 backend checks (parsing, guard, engine, rotation) |
 | `npm run test:logbus` | Self-check for `LogBus.clear()` truncation |
 | `npm run preview` | Serve the built renderer in a browser (no IPC bridge) |
+| `./tray.sh` | Panel tray icon (yad) with menu to control the headless service |
+| `./restart-opencode.sh` | Restart `opencode serve` with `HTTP_PROXY` pointing at 41987 |
 
 ## Where the WireGuard configs go
 
@@ -166,7 +195,9 @@ app after editing; pool and log folders can also be changed from the UI.
       "https://api.ipify.org?format=json"
     ],
     "timeoutMs": 9000,
-    "compareDirect": true
+    "compareDirect": true,
+    "refreshMs": 60000,
+    "staleAfterMs": 180000
   },
   "guard": { "cooldownMs": 75000 },
   "keeper": { "intervalMs": 10000, "failuresBeforeRestart": 2, "heartbeatLogMs": 90000 },
@@ -192,6 +223,11 @@ Launch actions read `client.desktop` and `client.cli`; nothing else is spawned f
   `bash -lc` with the same exports, then your `$SHELL`. Set `command`/`args` to override.
 - When **Desktop App Proxy** is on, both launches receive those proxy variables. This is per-process;
   it does not rewrite the system-wide OS proxy.
+- Launching OpenCode CLI should export the proxy env vars too, e.g.
+  `bash -lc "export HTTP_PROXY=http://127.0.0.1:41987 HTTPS_PROXY=... ALL_PROXY=... NO_PROXY=127.0.0.1,localhost,::1; exec opencode"`.
+  `opencode serve --service` is the process that actually sends model requests, so **it** must carry
+  the env vars. Use `./restart-opencode.sh` to guarantee that (also available as a user systemd unit
+  `opencode-serve.service`). Without it, the TUI may look fine while the serve process egresses directly.
 
 ### Stats card
 
@@ -217,6 +253,15 @@ inventing numbers. Point `workspaceDir` at your client's data directory to show 
 - Only triggers that actually cause a hop are counted; ignored ones (guard off, hop already in flight)
   appear in the Guard log but leave `triggers` untouched.
 - File truncation/rotation is handled by resetting the read offset.
+- The `timestamp=` field in a client log line is parsed and used as the trigger time, so a line read
+  late shows when the error actually happened (not when it was noticed). Lines older than the lookback
+  window are ignored so old history cannot re-trigger a hop.
+- A hop is only accepted if the new egress is verified **and** its IPv6 `/64` differs from the previous
+  one and is not in the burnt-block blacklist (persisted in `runtime/deck-state.json`, max 200). A
+  config that returns the same/already-burnt `/64` is rejected and the next config is tried.
+- Loop protection: if the quota wall comes back within 3 minutes of a successful hop, that hop is
+  counted as failed; after two such failures auto-rotation pauses for 2 minutes instead of burning
+  through the whole config pool.
 
 The watched files are `clientLogPath` (default `logs\client.log`) plus any extra paths in
 `clientLogPaths` — one entry per client that writes its own log. Both are relative to the deck home.
@@ -272,6 +317,10 @@ control-deck/
 │  ├─ test-backend.mjs    # backend test suite
 │  ├─ test-logbus.mjs     # LogBus.clear() self-check
 │  └─ fixtures/           # test-only SOCKS5 engine
+├─ assets/
+│  └─ tray.png            # panel tray icon
+├─ tray.sh                # yad AppIndicator launcher for headless mode
+├─ restart-opencode.sh    # restart opencode serve with proxy env
 ├─ engine/                # sing-box binary + its GPL licence (gitignored)
 ├─ warp-configs/          # your .conf pool (gitignored)
 ├─ logs/                  # guard.log / keeper.log / app.log / client.log
@@ -291,6 +340,9 @@ control-deck/
 | Proxy reachable but app ignores it | The app must honour `HTTP(S)_PROXY` or launch through **Launch CLI**. Updating the system-wide proxy is intentionally not done. |
 | Hop does nothing | The tunnel must be connected; the Rotate button is disabled while offline. |
 | Port 41987 busy | Another proxy is running. Change `proxy.port` and restart. |
+| Tray icon does not appear | Install `yad` and start `egress-tray.service`; Cinnamon needs `xapp-sn-watcher` running. Electron's own Tray is intentionally not used. |
+| App quits when the window is closed | In headless mode this is fixed; if you still see it, make sure `egress-monitor.service` runs with `EGRESS_HIDDEN=1` and no stale manual Electron instance is holding the single-instance lock. |
+| `opencode` ignores the proxy | The proxy env must be on the `opencode serve --service` process, not just the TUI. Use `./restart-opencode.sh` or `opencode-serve.service`. |
 
 ## Operational notes
 
@@ -299,3 +351,14 @@ control-deck/
   keys are never sent to the renderer or written to logs.
 - Counters, toggles, and the last config persist in `runtime/deck-state.json`.
 - The proxy binds to `127.0.0.1` only. Do not expose it on a LAN interface.
+- sing-box is rendered with an explicit DNS block: `1.1.1.1` over DoH routed through the `warp`
+  outbound (`detour: warp`), with `local` DNS kept for `.local`, `.ts.net`, and `localhost`. This
+  makes probes and upstream requests resolve inside the tunnel so the rotated `/64` is actually used,
+  instead of the host resolver returning anycast IPs that are unreachable from the WARP exit.
+- Proxy isolation is per-process: only processes given `HTTP(S)_PROXY`/`ALL_PROXY` (e.g. `opencode
+  serve`) use the WARP egress. The OS/system proxy is never changed, so games and other apps keep
+  their normal route.
+- Free-tier quota: providers such as OpenCode's free tier apply a **daily** limit that resets around
+  00:00 UTC; the `Retry-After` header on a 429 points to that reset. Rotating the IP cannot bypass a
+  time-window quota — the guard rotation is still useful for IP-based limits, but a daily wall has to
+  wait for the reset or use a different paid model.
