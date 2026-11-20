@@ -890,6 +890,7 @@ class EngineManager {
 
   async start({ config, entryName = '', format = 'endpoints' }) {
     await this.stop();
+    await this.killStaleEngines();
     await this.detect();
 
     const command = await this.resolveCommand();
@@ -978,7 +979,19 @@ class EngineManager {
           `engine exited with code ${child.exitCode}. ${tail(this.stderr, 700)}`,
         );
       }
-      if (await canConnect(this.host, this.port, 500)) return;
+      if (await canConnect(this.host, this.port, 500)) {
+        // The port can answer a beat before a bind failure surfaces (e.g. a
+        // stale engine held it and this child is about to exit). Give the
+        // child a moment and require it to still be alive before "ready".
+        await delay(250);
+        if (child.exitCode !== null || child.signalCode !== null) {
+          throw new EngineError(
+            'ENGINE_EXIT',
+            `engine exited with code ${child.exitCode}. ${tail(this.stderr, 700)}`,
+          );
+        }
+        return;
+      }
       await delay(120);
     }
 
@@ -1022,6 +1035,56 @@ class EngineManager {
 
     this.stopping = false;
     this.startedAt = null;
+  }
+
+  /**
+   * A previous run can leave a sing-box child orphaned (crash, forced quit,
+   * a failed rotation that stopped tracking it). It still holds the proxy
+   * port, so the next engine dies with "address already in use" while the
+   * readiness check mistakes the orphan's port for success. Reap any process
+   * running THIS deck's config before spawning — matched on the exact
+   * `run -c <configPath>` argv so nothing else can be hit.
+   */
+  async killStaleEngines() {
+    if (process.platform === 'win32') return;
+    const marker = `run -c ${this.configPath}`;
+    const stale = [];
+    let entries;
+    try {
+      entries = await fsp.readdir('/proc');
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (pid === process.pid || (this.child && pid === this.child.pid)) continue;
+      let cmdline;
+      try {
+        cmdline = (await fsp.readFile(`/proc/${pid}/cmdline`, 'utf8')).replace(/\0/g, ' ');
+      } catch {
+        continue; // process exited or not readable
+      }
+      if (cmdline.includes(marker)) stale.push(pid);
+    }
+    if (!stale.length) return;
+    for (const pid of stale) {
+      try {
+        process.kill(pid, 'SIGTERM');
+        this.log?.('app', 'warn', `stale engine pid ${pid} reaped before start (held ${this.host}:${this.port})`);
+      } catch {
+        /* already gone */
+      }
+    }
+    await delay(1200);
+    for (const pid of stale) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* exited after SIGTERM */
+      }
+    }
+    await delay(300);
   }
 }
 
@@ -1852,15 +1915,9 @@ class Deck {
       await this.savePersisted();
       return { ok: true, message: `Tunnel up via ${started.name}.` };
     } catch (error) {
-      this.state.connected = false;
       this.state.lastError = error.message;
       this.state.lastErrorCode = error.code || 'CONNECT_FAILED';
-      this.state.engine = {
-        ...this.state.engine,
-        state: 'stopped',
-        pid: null,
-        error: error.message,
-      };
+      this.reconcileEngineState(error.message);
       this.log('keeper', 'error', `tunnel up failed · ${error.message}`);
       return { ok: false, message: error.message };
     } finally {
@@ -1930,6 +1987,39 @@ class Deck {
       onAttempt: (entry, error) =>
         this.log('guard', 'error', `${reason} -> rotating to ${entry.name} -> failed: ${error.message}`),
     });
+  }
+
+  /**
+   * A failed hop/connect does not always mean the engine is down: the last
+   * candidate may have started and bound the port, and only the egress verify
+   * rejected it (burnt/reused /64, probe timeout). Declaring the engine stopped
+   * while it is actually running strands the console offline — the keeper only
+   * reconnects when the port is unreachable, so nothing ever recovers. Reflect
+   * the live engine instead; the failure stays visible via lastError and the
+   * keeper's periodic egress recheck heals the status once the probe passes.
+   */
+  reconcileEngineState(errorMessage) {
+    const child = this.engine?.child;
+    const alive = Boolean(child && child.exitCode === null && child.signalCode === null);
+    if (alive) {
+      this.state.connected = true;
+      this.state.engine = {
+        ...this.state.engine,
+        state: 'running',
+        pid: child.pid ?? null,
+        error: errorMessage,
+      };
+      this.state.proxy.listening = true;
+    } else {
+      this.state.connected = false;
+      this.state.engine = {
+        ...this.state.engine,
+        state: 'stopped',
+        pid: null,
+        error: errorMessage,
+      };
+      this.state.proxy.listening = false;
+    }
   }
 
   async rotate(reason = 'manual') {
@@ -2047,9 +2137,7 @@ class Deck {
     } catch (error) {
       this.state.lastError = error.message;
       this.state.lastErrorCode = error.code || 'ROTATE_FAILED';
-      this.state.connected = false;
-      this.state.engine = { ...this.state.engine, state: 'stopped', pid: null, error: error.message };
-      this.state.proxy.listening = false;
+      this.reconcileEngineState(error.message);
       this.log('guard', 'error', `rotation failed · ${error.message}`);
       return { ok: false, message: error.message };
     } finally {

@@ -836,6 +836,58 @@ await test('rotate refuses to land on the previous or a burnt /64', async () => 
   }
 });
 
+await test('failed rotation keeps a live engine connected instead of stranding offline', async () => {
+  const home = await makeDeckHome('deck-stranded');
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+
+    // The last candidate started and bound the port; only the /64 verify
+    // rejects it. The engine child is alive, so the console must not declare
+    // the tunnel offline — the keeper only reconnects on a dead port, so a
+    // false "stopped" strands the app until a manual restart.
+    deck.engine = { child: { pid: 4242, exitCode: null, signalCode: null }, stop: async () => {} };
+    const sameBlock = {
+      ip: '2a09:bac5:3a12:25b9::1',
+      family: 'ipv6',
+      block64: '2a09:bac5:3a12:25b9::/64',
+      subnet64: '2a09:bac5:3a12:25b9',
+      verified: true,
+      leaked: false,
+      directIp: null,
+      checkedAt: new Date().toISOString(),
+      error: null,
+    };
+    deck.state.egress = { ...sameBlock };
+    deck.currentEntry = deck.pool.entries[0];
+    deck.probe = async () => ({ ...sameBlock, checkedAt: new Date().toISOString() });
+
+    const result = await deck.rotate('log-guard');
+    assert.equal(result.ok, false, 'the hop itself still fails on the reused /64');
+    assert.equal(deck.state.connected, true, 'a live engine must keep the tunnel connected');
+    assert.equal(deck.state.engine.state, 'running');
+    assert.equal(deck.state.engine.pid, 4242);
+    assert.equal(deck.state.proxy.listening, true);
+    assert.ok(deck.state.lastError, 'the rotation failure stays visible');
+
+    // With the engine actually gone, the same failure must report offline.
+    deck.engine = { child: null, stop: async () => {} };
+    const offline = await deck.rotate('log-guard');
+    assert.equal(offline.ok, false);
+    assert.equal(deck.state.connected, false);
+    assert.equal(deck.state.engine.state, 'stopped');
+    assert.equal(deck.state.engine.pid, null);
+  } finally {
+    await deck.dispose();
+  }
+});
+
 await test('linux launcher helpers: XDG autostart file and PATH lookup', async () => {
   const entry = path.join(root, 'autostart', 'egress-monitor.desktop');
   assert.equal(await setLinuxAutostart(true, entry), true);

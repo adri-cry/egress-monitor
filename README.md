@@ -132,7 +132,7 @@ needed in either case.
 | `npm run build` | Production renderer build in `dist/` |
 | `npm start` | Build, then launch Electron |
 | `npm run engine:fetch` | Download the `sing-box` binary for this OS/arch into `engine/` |
-| `npm run test:backend` | 25 backend checks (parsing, guard, engine, rotation) |
+| `npm run test:backend` | 28 backend checks (parsing, guard, engine, rotation) |
 | `npm run test:logbus` | Self-check for `LogBus.clear()` truncation |
 | `npm run preview` | Serve the built renderer in a browser (no IPC bridge) |
 | `./tray.sh` | Panel tray icon (yad) with menu to control the headless service |
