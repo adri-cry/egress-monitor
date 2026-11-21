@@ -317,6 +317,114 @@ function ToggleRow({ icon: Icon, title, description, tag, enabled, onToggle, dis
   );
 }
 
+function UsagePanel({ usage, now, onOptions, disabled }) {
+  const cap = usage.cap > 0 ? usage.cap : 200;
+  const requests = usage.requests || 0;
+  const pct = Math.min(100, Math.round((requests / cap) * 100));
+  const warnPct = Math.round((usage.warnRatio || 0.8) * 100);
+  const hopPct = Math.round((usage.hopRatio || 0.9) * 100);
+  const tone = !usage.reachable
+    ? 'muted'
+    : pct >= hopPct
+      ? 'fault'
+      : pct >= warnPct
+        ? 'amber'
+        : 'mint';
+  const bar = tone === 'fault' ? 'bg-fault/80' : tone === 'amber' ? 'bg-amber/80' : 'bg-mint/70';
+  const num = tone === 'fault' ? 'text-fault' : tone === 'amber' ? 'text-amber' : 'text-mint';
+  const resetMs = usage.resetAt ? Math.max(0, new Date(usage.resetAt).getTime() - now) : null;
+  const resetLabel =
+    resetMs === null
+      ? '—'
+      : `${pad(Math.floor(resetMs / 3600000))}:${pad(Math.floor((resetMs % 3600000) / 60000))}:${pad(Math.floor((resetMs % 60000) / 1000))}`;
+  const history = (usage.history || []).slice(-3).reverse();
+  return (
+    <section className="panel px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.18em] text-ink-3">
+          <Gauge className="h-3.5 w-3.5 text-blue" strokeWidth={1.8} />
+          OPENCODE FREE-TIER USAGE
+          <Chip tone="muted">PER EGRESS IP · ESTIMATE</Chip>
+        </div>
+        <div className="flex items-center gap-1.5 font-mono text-[8.5px] uppercase tracking-[0.1em] text-ink-4">
+          <Dot tone={usage.reachable ? 'mint' : 'amber'} pulse={usage.reachable} />
+          <span className="max-w-[420px] truncate">
+            {usage.reachable
+              ? `opencode serve · ${usage.sessions || 0} sessions`
+              : `opencode offline${usage.error ? ` · ${usage.error}` : ''}`}
+          </span>
+        </div>
+      </div>
+      <div className="mt-2.5 grid gap-4 md:grid-cols-[1.5fr_1fr_1.1fr]">
+        <div>
+          <div className="flex items-baseline gap-1.5">
+            <span className={`font-mono text-[24px] leading-none tracking-[-0.04em] ${num}`}>
+              {requests}
+            </span>
+            <span className="font-mono text-[10px] text-ink-3">/ ~{cap} requests</span>
+            <span className="ml-auto font-mono text-[9px] uppercase tracking-[0.1em] text-ink-4">
+              current /64 · {pct}%
+            </span>
+          </div>
+          <div className="mt-2 h-[5px] w-full overflow-hidden rounded-full bg-white/[0.05]">
+            <div className={`h-full rounded-full transition-all ${bar}`} style={{ width: `${pct}%` }} />
+          </div>
+          <div className="mt-1.5 font-mono text-[8.5px] uppercase tracking-[0.08em] text-ink-4">
+            {usage.lastHopAt ? `window since hop ${timeAgo(usage.lastHopAt, now)}` : 'window since config commit'}
+            {' · '}warn {warnPct}% · pre-hop {hopPct}%
+          </div>
+        </div>
+        <div className="space-y-1.5 font-mono text-[9px] uppercase tracking-[0.08em]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-ink-4">today (all IPs)</span>
+            <span className="text-ink-2">{usage.today || 0} req</span>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-ink-4">reset 00:00 UTC</span>
+            <span className="text-ink-2">{resetLabel}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-ink-4">client</span>
+            <span className={usage.anyBusy ? 'text-amber' : 'text-mint'}>
+              {usage.anyBusy ? `busy · ${usage.busySessions || 1} session` : `idle · ${usage.idleStreak || 0} polls`}
+            </span>
+          </div>
+        </div>
+        <div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold text-ink">Pre-emptive hop</div>
+              <p className="mt-0.5 text-[9.5px] leading-snug text-ink-3">
+                Hop to a fresh /64 at {hopPct}% while every session is idle — before the wall kills a prompt.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={Boolean(usage.preemptiveHop)}
+              aria-label="Pre-emptive hop"
+              disabled={disabled}
+              onClick={() => onOptions({ preemptiveHop: !usage.preemptiveHop })}
+              className="switch shrink-0 disabled:opacity-40"
+              data-on={usage.preemptiveHop ? 'true' : 'false'}
+            />
+          </div>
+          {history.length ? (
+            <div className="mt-2 space-y-0.5 border-t border-white/[0.05] pt-1.5 font-mono text-[8px] uppercase tracking-[0.06em] text-ink-4">
+              {history.map((h, i) => (
+                <div key={`${h.at}-${i}`} className="flex items-center justify-between gap-2">
+                  <span className="truncate">{h.config} · {h.reason}</span>
+                  <span className="text-ink-3">{h.requests} req used</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function LogViewer({ logs, paths, activeTab, onTabChange, onCopy, onClear, clearing, onOpenLogs }) {
   const listRef = useRef(null);
   const [stick, setStick] = useState(true);
@@ -497,6 +605,7 @@ export default function App() {
     refresh,
     launch,
     setToggle,
+    setUsageOptions,
     choosePoolDir,
     copyText,
     activeLogText,
@@ -852,6 +961,13 @@ export default function App() {
               </div>
             </MetricCard>
           </div>
+
+          <UsagePanel
+            usage={state.usage || {}}
+            now={now}
+            disabled={Boolean(busy)}
+            onOptions={setUsageOptions}
+          />
 
           <div className="grid flex-1 gap-3.5 xl:grid-cols-[1.16fr_1fr]">
             <section className="panel flex flex-col overflow-hidden">

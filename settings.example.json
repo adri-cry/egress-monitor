@@ -19,6 +19,15 @@
     "compareDirect": true
   },
   "guard": { "cooldownMs": 75000 },
+  "usage": {
+    "enabled": true,
+    "pollMs": 45000,
+    "dailyCap": 200,
+    "warnRatio": 0.8,
+    "preemptiveHop": true,
+    "hopRatio": 0.9,
+    "servicePath": ""
+  },
   "keeper": {
     "intervalMs": 10000,
     "failuresBeforeRestart": 2,

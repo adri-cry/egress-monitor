@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('deck', {
   connect: () => ipcRenderer.invoke('deck:connect'),
   disconnect: () => ipcRenderer.invoke('deck:disconnect'),
   setToggle: (id, enabled) => ipcRenderer.invoke('deck:toggle', String(id), Boolean(enabled)),
+  setUsageOptions: (patch) => ipcRenderer.invoke('deck:usage:options', patch),
   launch: (kind) => ipcRenderer.invoke('deck:launch', String(kind)),
 
   // paths

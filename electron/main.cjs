@@ -24,6 +24,17 @@ const dns = require('node:dns/promises');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const chokidar = require('chokidar');
+const http = require('node:http');
+const https = require('node:https');
+const {
+  startOfUtcDay,
+  nextUtcMidnight,
+  countRequests,
+  sessionBusy,
+  summarizeSessions,
+  usageRatio,
+  shouldPreemptiveHop,
+} = require('./lib/usage.cjs');
 
 const {
   ipFamily,
@@ -49,6 +60,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(PROJECT_ROOT, 'dist');
 
 const TOGGLE_IDS = ['keeper', 'logGuard', 'desktopProxy', 'autoStart'];
+const OPENCODE_SERVICE_PATH = path.join(os.homedir(), '.local', 'state', 'opencode', 'service.json');
 const LOG_TABS = ['guard', 'keeper', 'app'];
 
 const IS_WIN = process.platform === 'win32';
@@ -281,6 +293,17 @@ function defaultSettings() {
       staleAfterMs: 180000,
     },
     guard: { cooldownMs: 75000 },
+    usage: {
+      enabled: true,
+      pollMs: 45000,
+      // Community-reported zen free-tier cap (~200 req/day per egress IP).
+      // Not official — the counter is an estimate, the LogGuard stays armed.
+      dailyCap: 200,
+      warnRatio: 0.8,
+      preemptiveHop: true,
+      hopRatio: 0.9,
+      servicePath: '',
+    },
     keeper: { intervalMs: 10000, failuresBeforeRestart: 2, heartbeatLogMs: 90000 },
     logs: { maxBytes: 2 * 1024 * 1024 },
     client: {
@@ -384,6 +407,16 @@ function normalizeSettings(raw) {
     5000,
     3600000,
   );
+  settings.usage.pollMs = clampInt(settings.usage.pollMs, defaults.usage.pollMs, 10000, 600000);
+  settings.usage.dailyCap = clampInt(settings.usage.dailyCap, defaults.usage.dailyCap, 1, 100000);
+  const unitRatio = (value, fallback) =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1
+      ? value
+      : fallback;
+  settings.usage.warnRatio = unitRatio(settings.usage.warnRatio, defaults.usage.warnRatio);
+  settings.usage.hopRatio = unitRatio(settings.usage.hopRatio, defaults.usage.hopRatio);
+  settings.usage.enabled = Boolean(settings.usage.enabled);
+  settings.usage.preemptiveHop = Boolean(settings.usage.preemptiveHop);
   settings.logs.maxBytes = clampInt(
     settings.logs.maxBytes,
     defaults.logs.maxBytes,
@@ -533,6 +566,17 @@ class LogBus {
  */
 const QUOTA_PATTERN =
   /quota[\s_-]*exceeded|freeusage|free usage limit|insufficient[\s_-]?quota|rate limit|too many requests/i;
+
+/**
+ * opencode's free-tier wall ("Free usage limit reached" / FreeUsageLimitError).
+ * The daily request bucket is keyed by EGRESS IP, not an account — anonymous
+ * clients have none (zen console: IpRateLimitTable / createIpRateLimiter) —
+ * shared across all free models, resets 00:00 UTC. A fresh /64 is a fresh
+ * bucket, so this line is exactly what rotation is for; recognized only to
+ * explain the hop in the log. WARP /64s can arrive pre-consumed by other
+ * users; the rewall backoff brakes that churn.
+ */
+const FREE_TIER_PATTERN = /free\s*usage\s*limit|freeusage/i;
 
 class LogGuard {
   constructor({
@@ -1119,6 +1163,7 @@ class Deck {
       burntBlocks: [],
       failedHops: 0,
       lastOkHop: 0,
+      usageHistory: [],
       toggles: { keeper: true, logGuard: true, desktopProxy: true, autoStart: false },
     };
 
@@ -1137,6 +1182,18 @@ class Deck {
     this.keeperFailures = 0;
     this.egressFailures = 0;
     this.backoffUntil = 0;
+    this.backoffReason = null;
+    // When the running config was committed (successful connect/hop/select).
+    // Quota lines logged before this belong to a tunnel that is already gone.
+    this.currentConfigSince = 0;
+    this.usageTimer = null;
+    this.usageFirstTimer = null;
+    this.usageBusy = false;
+    this.usageIdleStreak = 0;
+    this.usageWarnedFor = 0;
+    this.usageFailures = 0;
+    this.preemptiveBackoffUntil = 0;
+    this.rawSettings = null;
     this.lastHeartbeatLog = 0;
     this.workspaceCache = { at: 0, projects: null, chats: null };
     this.proxySession = null;
@@ -1188,6 +1245,26 @@ class Deck {
         cooldownUntil: null,
         cooldownMs: 75000,
         triggers: 0,
+      },
+      usage: {
+        enabled: true,
+        reachable: false,
+        checkedAt: null,
+        error: null,
+        requests: 0,
+        today: 0,
+        cap: 200,
+        ratio: 0,
+        warnRatio: 0.8,
+        hopRatio: 0.9,
+        resetAt: null,
+        preemptiveHop: true,
+        anyBusy: false,
+        sessions: 0,
+        busySessions: 0,
+        idleStreak: 0,
+        lastHopAt: null,
+        history: [],
       },
       keeper: {
         running: false,
@@ -1287,6 +1364,8 @@ class Deck {
       );
     }
 
+    this.startUsagePoller();
+
     this.computeStatus();
     this.broadcast();
 
@@ -1306,6 +1385,7 @@ class Deck {
 
   async dispose() {
     this.stopKeeper();
+    this.stopUsagePoller();
     await this.guard?.stop();
     await this.engine?.stop();
     await this.savePersisted();
@@ -1332,6 +1412,12 @@ class Deck {
       this.settings = this.materializeSettings(loaded);
     }
 
+    this.rawSettings = loaded;
+    this.state.usage.enabled = this.settings.usage.enabled;
+    this.state.usage.cap = this.settings.usage.dailyCap;
+    this.state.usage.warnRatio = this.settings.usage.warnRatio;
+    this.state.usage.hopRatio = this.settings.usage.hopRatio;
+    this.state.usage.preemptiveHop = this.settings.usage.preemptiveHop;
     this.paths.pool = this.settings.poolDir;
     this.paths.clientLog = this.settings.clientLogPath;
     this.paths.workspace = this.settings.workspaceDir;
@@ -1388,6 +1474,10 @@ class Deck {
         ...parsed,
         toggles: { ...this.persisted.toggles, ...(parsed.toggles || {}) },
       };
+      this.persisted.usageHistory = Array.isArray(parsed.usageHistory)
+        ? parsed.usageHistory.slice(-20)
+        : [];
+      this.state.usage.history = this.persisted.usageHistory;
     } catch {
       /* corrupted state is not fatal */
     }
@@ -1401,6 +1491,9 @@ class Deck {
       ? this.persisted.burntBlocks.slice(-200)
       : [];
     this.persisted.currentConfig = this.currentEntry?.name ?? this.state.pool.currentFile;
+    this.persisted.usageHistory = Array.isArray(this.persisted.usageHistory)
+      ? this.persisted.usageHistory.slice(-20)
+      : [];
     this.persisted.toggles = { ...this.state.toggles };
 
     const payload = JSON.stringify(this.persisted, null, 2);
@@ -1442,7 +1535,12 @@ class Deck {
           ? this.pool.entries.findIndex((entry) => entry.name === this.currentEntry.name)
           : -1,
       },
-      guard: { ...this.state.guard, watching: Boolean(this.guard?.watching) },
+      guard: {
+        ...this.state.guard,
+        watching: Boolean(this.guard?.watching),
+        backoffUntil: this.backoffUntil ? new Date(this.backoffUntil).toISOString() : null,
+        backoffReason: this.backoffReason ?? null,
+      },
       keeper: { ...this.state.keeper, running: this.state.toggles.keeper },
       paths: { ...this.state.paths },
     };
@@ -1912,12 +2010,18 @@ class Deck {
           : `tunnel listening but egress unverified · ${started.name} · ${Date.now() - startedAt}ms · ${this.state.egress.error || 'probe failed'}`,
       );
       this.state.pool.currentFile = started.name;
+      this.currentConfigSince = Date.now();
+      this.resetUsageWindow();
+      this.writeTrayStatus();
       await this.savePersisted();
       return { ok: true, message: `Tunnel up via ${started.name}.` };
     } catch (error) {
       this.state.lastError = error.message;
       this.state.lastErrorCode = error.code || 'CONNECT_FAILED';
       this.reconcileEngineState(error.message);
+      // Persist what is actually running: a failed verify can leave a live
+      // engine on a different config than the one disk still names.
+      await this.savePersisted();
       this.log('keeper', 'error', `tunnel up failed · ${error.message}`);
       return { ok: false, message: error.message };
     } finally {
@@ -1944,6 +2048,7 @@ class Deck {
     this.state.lastError = null;
     this.state.lastErrorCode = null;
     this.log('keeper', 'warn', 'tunnel disconnected by operator · engine stopped');
+    this.writeTrayStatus();
     this.computeStatus();
     await this.savePersisted();
     this.broadcast();
@@ -2036,7 +2141,9 @@ class Deck {
         ? 'log-guard detected trigger'
         : reason === 'keeper'
           ? 'keeper watchdog'
-          : 'operator hop';
+          : reason === 'usage'
+            ? 'usage pre-hop'
+            : 'operator hop';
 
     this.rotating = true;
     this.state.rotating = true;
@@ -2063,7 +2170,7 @@ class Deck {
         .map((item) => ipv6Block64(item))
         .filter(Boolean),
     );
-    if (reason === 'log-guard' && previousBlock) {
+    if ((reason === 'log-guard' || reason === 'usage') && previousBlock) {
       const key = ipv6Block64(previousBlock);
       if (key && !burnt.has(key)) {
         burnt.add(key);
@@ -2093,7 +2200,7 @@ class Deck {
       if (!started) {
         // Do not lose the retirement: the /64 that just hit the quota wall must
         // stay blacklisted even when no fresh config could be started.
-        if (reason === 'log-guard' && previousBlock) {
+        if ((reason === 'log-guard' || reason === 'usage') && previousBlock) {
           const key = ipv6Block64(previousBlock);
           if (key) this.persisted.burntBlocks = [...new Set([...burnt, key])];
         }
@@ -2107,12 +2214,28 @@ class Deck {
       this.persisted.lastOkHop = Date.now();
       this.persisted.failedHops = 0;
       this.backoffUntil = 0;
+      this.backoffReason = null;
       // A /64 is only "retired" when its quota was exhausted; keeper and manual
       // hops are routine swaps. previousBlock is null on IPv4 egress, so key the
       // counter off the trigger reason instead of the egress family.
       const retired = reason === 'log-guard';
       this.state.stats.blacklisted += retired ? 1 : 0;
       this.state.pool.currentFile = started.name;
+      this.currentConfigSince = Date.now();
+      // Record what the previous /64 consumed before the usage window resets.
+      this.persisted.usageHistory = [
+        ...(Array.isArray(this.persisted.usageHistory) ? this.persisted.usageHistory : []),
+        {
+          at: new Date().toISOString(),
+          reason,
+          config: started.name,
+          block64: this.state.egress.block64 || null,
+          requests: this.state.usage.requests,
+        },
+      ].slice(-20);
+      this.state.usage.history = this.persisted.usageHistory;
+      this.resetUsageWindow();
+      this.writeTrayStatus();
 
       const elapsed = Date.now() - startedAt;
       this.log('guard', 'success', `${label} -> rotating to ${started.name} -> success.`);
@@ -2138,6 +2261,9 @@ class Deck {
       this.state.lastError = error.message;
       this.state.lastErrorCode = error.code || 'ROTATE_FAILED';
       this.reconcileEngineState(error.message);
+      // The last candidate may be live even though the hop failed: persist
+      // the reconciled state so disk names the config the engine runs.
+      await this.savePersisted();
       this.log('guard', 'error', `rotation failed · ${error.message}`);
       return { ok: false, message: error.message };
     } finally {
@@ -2171,6 +2297,9 @@ class Deck {
       await this.probe({ compareDirect: this.settings.probe.compareDirect });
       await this.scanWorkspace();
       this.state.pool.currentFile = started.name;
+      this.currentConfigSince = Date.now();
+      this.resetUsageWindow();
+      this.writeTrayStatus();
       this.log(
         'keeper',
         'success',
@@ -2181,9 +2310,10 @@ class Deck {
     } catch (error) {
       this.state.lastError = error.message;
       this.state.lastErrorCode = error.code || 'SELECT_FAILED';
-      this.state.connected = false;
-      this.state.engine = { ...this.state.engine, state: 'stopped', pid: null, error: error.message };
-      this.state.proxy.listening = false;
+      // A failed probe can leave the engine live on the selected config;
+      // reflect reality instead of stranding the console offline.
+      this.reconcileEngineState(error.message);
+      await this.savePersisted();
       this.log('keeper', 'error', `select ${entry.name} failed · ${error.message}`);
       return { ok: false, message: error.message };
     } finally {
@@ -2230,10 +2360,35 @@ class Deck {
       return;
     }
 
+    // A quota line logged before the current config was committed belongs to
+    // a tunnel that is already gone — typically a cooldown-deferred trigger
+    // that outlived the operator's manual hop. Acting on it would evict the
+    // very config the operator just picked and burn its /64 for nothing.
+    const loggedAt = Number(info.at);
+    if (this.currentConfigSince && Number.isFinite(loggedAt) && loggedAt < this.currentConfigSince) {
+      this.log(
+        'guard',
+        'warn',
+        `quota line predates ${this.currentEntry?.name ?? 'current config'} · logged ${stamp(new Date(loggedAt))} · active since ${stamp(new Date(this.currentConfigSince))} · trigger dropped`,
+      );
+      await this.savePersisted();
+      this.broadcast();
+      return;
+    }
+
+    const now = Date.now();
+
+    if (FREE_TIER_PATTERN.test(info.line || '')) {
+      this.log(
+        'guard',
+        'info',
+        'opencode free-tier daily per-IP quota · a fresh /64 gets a fresh bucket · rotating',
+      );
+    }
+
     // Loop protection: if a fresh /64 hits the wall again almost immediately,
     // the address did not help. Pause auto-rotation briefly instead of burning
     // through the whole config pool in a minute.
-    const now = Date.now();
     const REWALL_MS = 3 * 60 * 1000;
     const BACKOFF_MS = 2 * 60 * 1000;
     const FAILED_HOPS_MAX = 2;
@@ -2257,6 +2412,7 @@ class Deck {
       );
       if (this.persisted.failedHops >= FAILED_HOPS_MAX) {
         this.backoffUntil = now + BACKOFF_MS;
+        this.backoffReason = 'rewall';
         this.persisted.failedHops = 0;
         this.log('guard', 'warn', `pausing auto-rotation for ${BACKOFF_MS / 60000} min — new /64s keep hitting the wall`);
       }
@@ -2307,6 +2463,261 @@ class Deck {
 
     this.computeStatus();
     this.broadcast();
+  }
+
+  // -- usage (opencode zen free tier) ---------------------------------------
+
+  startUsagePoller() {
+    this.stopUsagePoller();
+    if (!this.settings.usage.enabled) return;
+    const ms = this.settings.usage.pollMs;
+    this.usageTimer = setInterval(() => {
+      this.usageTick().catch((error) =>
+        this.log('app', 'error', `usage tick failed · ${error.message}`),
+      );
+    }, ms);
+    // First poll shortly after boot so the panel is not empty for a full cycle.
+    this.usageFirstTimer = setTimeout(() => {
+      this.usageTick().catch(() => {});
+    }, 4000);
+    this.log(
+      'app',
+      'info',
+      `usage poller armed · every ${Math.round(ms / 1000)}s · cap ~${this.settings.usage.dailyCap} req/IP/day (estimate) · pre-hop ${this.settings.usage.preemptiveHop ? 'on' : 'off'}`,
+    );
+  }
+
+  stopUsagePoller() {
+    if (this.usageTimer) clearInterval(this.usageTimer);
+    if (this.usageFirstTimer) clearTimeout(this.usageFirstTimer);
+    this.usageTimer = null;
+    this.usageFirstTimer = null;
+  }
+
+  /**
+   * Count zen free-tier requests on the current /64 (and today), warn once per
+   * window at warnRatio, and pre-hop to a fresh /64 at hopRatio while every
+   * opencode session is idle. The count is a lower-bound estimate; the reactive
+   * LogGuard remains the safety net.
+   */
+  async usageTick() {
+    if (this.usageBusy) return;
+    this.usageBusy = true;
+    try {
+      const now = Date.now();
+      const u = this.state.usage;
+      u.resetAt = new Date(nextUtcMidnight(now)).toISOString();
+      let data;
+      try {
+        data = await this.fetchUsageData();
+        if (!u.reachable) {
+          this.log('app', 'success', 'usage poller · opencode serve reachable · counting zen requests');
+        }
+        u.reachable = true;
+        u.error = null;
+        this.usageFailures = 0;
+      } catch (error) {
+        this.usageFailures += 1;
+        if (u.reachable || this.usageFailures === 1) {
+          this.log('app', 'warn', `usage poller · opencode serve unreachable · ${error.message}`);
+        }
+        u.reachable = false;
+        u.error = error.message;
+        u.checkedAt = new Date(now).toISOString();
+        this.writeTrayStatus();
+        this.broadcast();
+        return;
+      }
+
+      const sinceHop = this.currentConfigSince || now;
+      const sinceDay = startOfUtcDay(now);
+      const counts = countRequests(data.messages, { sinceHop, sinceDay });
+      const sess = summarizeSessions(data.sessions);
+      this.usageIdleStreak = sess.anyBusy ? 0 : this.usageIdleStreak + 1;
+      const cap = this.settings.usage.dailyCap;
+      const ratio = usageRatio(counts.hop, cap);
+      Object.assign(u, {
+        checkedAt: new Date(now).toISOString(),
+        requests: counts.hop,
+        today: counts.day,
+        cap,
+        ratio,
+        warnRatio: this.settings.usage.warnRatio,
+        hopRatio: this.settings.usage.hopRatio,
+        preemptiveHop: this.settings.usage.preemptiveHop,
+        enabled: this.settings.usage.enabled,
+        anyBusy: sess.anyBusy,
+        sessions: sess.total,
+        busySessions: sess.busy,
+        idleStreak: this.usageIdleStreak,
+      });
+
+      if (ratio >= u.warnRatio && this.usageWarnedFor !== sinceHop) {
+        this.usageWarnedFor = sinceHop;
+        this.log(
+          'guard',
+          'warn',
+          `free-tier usage ${counts.hop}/${cap} (~${Math.round(ratio * 100)}%) on current /64 · approaching the daily wall`,
+        );
+      }
+
+      if (
+        shouldPreemptiveHop({
+          enabled: u.preemptiveHop,
+          connected: this.state.connected,
+          rotating: this.rotating,
+          manualOffline: this.persisted.manualOffline,
+          requests: counts.hop,
+          cap,
+          hopRatio: u.hopRatio,
+          anyBusy: sess.anyBusy,
+          idleStreak: this.usageIdleStreak,
+          backoffUntil: this.preemptiveBackoffUntil,
+          now,
+        })
+      ) {
+        this.log(
+          'guard',
+          'info',
+          `usage pre-hop · ${counts.hop}/${cap} on current /64 · idle ${this.usageIdleStreak} polls · hopping before the wall`,
+        );
+        const result = await this.rotate('usage');
+        if (!result.ok) {
+          this.preemptiveBackoffUntil = Date.now() + 5 * 60 * 1000;
+          this.log('guard', 'warn', `usage pre-hop failed · ${result.message} · next attempt in 5m`);
+        }
+      }
+
+      this.writeTrayStatus();
+      this.broadcast();
+    } catch (error) {
+      this.log('app', 'error', `usage tick failed · ${error.message}`);
+    } finally {
+      this.usageBusy = false;
+    }
+  }
+
+  /** Read opencode serve's local API (no egress, no quota burn). */
+  async fetchUsageData() {
+    const servicePath = this.settings.usage.servicePath || OPENCODE_SERVICE_PATH;
+    const svc = JSON.parse(await fsp.readFile(servicePath, 'utf8'));
+    if (!svc || !svc.url || !svc.password) {
+      throw new Error('opencode service.json has no url/password');
+    }
+    const base = String(svc.url).replace(/\/+$/, '');
+    const auth = `Basic ${Buffer.from(`opencode:${svc.password}`).toString('base64')}`;
+    const payload = await this.localJson(`${base}/api/session`, auth);
+    const sessions = Array.isArray(payload?.data) ? payload.data : null;
+    if (!sessions) throw new Error('unexpected /api/session payload');
+    const windowStart = Math.min(this.currentConfigSince || Date.now(), startOfUtcDay(Date.now()));
+    // Only sessions touched inside the window (or busy right now) can carry
+    // relevant messages; cap the fan-out so a huge history stays cheap.
+    const relevant = sessions
+      .filter((s) => Number((s.time || {}).updated) >= windowStart || sessionBusy(s))
+      .slice(0, 30);
+    const messages = [];
+    for (const session of relevant) {
+      const ms = await this.localJson(`${base}/api/session/${session.id}/message`, auth);
+      if (Array.isArray(ms?.data)) messages.push(...ms.data);
+    }
+    return { sessions, messages };
+  }
+
+  localJson(url, auth) {
+    return new Promise((resolve, reject) => {
+      const mod = url.startsWith('https:') ? https : http;
+      const request = mod.request(
+        url,
+        { headers: { Authorization: auth, Accept: 'application/json' }, timeout: 8000 },
+        (response) => {
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            response.resume();
+            reject(new Error(`HTTP ${response.statusCode} from ${url}`));
+            return;
+          }
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => {
+            body += chunk;
+          });
+          response.on('end', () => {
+            try {
+              resolve(JSON.parse(body));
+            } catch (error) {
+              reject(new Error(`invalid JSON from ${url}: ${error.message}`));
+            }
+          });
+        },
+      );
+      request.on('timeout', () => request.destroy(new Error(`timeout after 8000ms: ${url}`)));
+      request.on('error', reject);
+      request.end();
+    });
+  }
+
+  /** A new config commitment starts a fresh per-IP usage window. */
+  resetUsageWindow() {
+    const u = this.state.usage;
+    if (!u) return;
+    u.requests = 0;
+    u.ratio = 0;
+    u.lastHopAt = new Date().toISOString();
+    this.usageWarnedFor = 0;
+    this.usageIdleStreak = 0;
+  }
+
+  /** Status file consumed by tray.sh (tooltip + warning icon). */
+  writeTrayStatus() {
+    const u = this.state.usage || {};
+    const config = this.currentEntry?.name || this.state.pool.currentFile || 'no config';
+    const ip = this.state.egress.block64 || this.state.egress.ip || 'no egress';
+    const pct = u.cap ? Math.round(((u.requests || 0) / u.cap) * 100) : 0;
+    const usageText = u.reachable
+      ? `usage ${u.requests || 0}/${u.cap} (${pct}%)`
+      : 'usage — (opencode offline)';
+    const status = {
+      at: new Date().toISOString(),
+      connected: Boolean(this.state.connected),
+      warn: Boolean(u.reachable && u.cap && (u.requests || 0) / u.cap >= (u.warnRatio || 0.8)),
+      tooltip: `Egress Monitor · ${this.state.connected ? config : 'offline'} · ${ip} · ${usageText}`,
+    };
+    fsp
+      .writeFile(path.join(this.paths.runtime, 'tray-status.json'), `${JSON.stringify(status, null, 2)}\n`, 'utf8')
+      .catch(() => {});
+  }
+
+  async setUsageOptions(patch = {}) {
+    const options = patch && typeof patch === 'object' ? patch : {};
+    const allowed = ['enabled', 'preemptiveHop', 'dailyCap', 'warnRatio', 'hopRatio', 'pollMs'];
+    const next = { ...this.settings.usage };
+    for (const key of allowed) {
+      if (options[key] !== undefined) next[key] = options[key];
+    }
+    const normalized = normalizeSettings({ ...(this.rawSettings || {}), usage: next });
+    this.rawSettings = normalized;
+    this.settings = this.materializeSettings(normalized);
+    await this.saveSettingsFile();
+    const u = this.state.usage;
+    Object.assign(u, {
+      enabled: this.settings.usage.enabled,
+      cap: this.settings.usage.dailyCap,
+      warnRatio: this.settings.usage.warnRatio,
+      hopRatio: this.settings.usage.hopRatio,
+      preemptiveHop: this.settings.usage.preemptiveHop,
+    });
+    if (this.settings.usage.enabled) this.startUsagePoller();
+    else this.stopUsagePoller();
+    this.log(
+      'app',
+      'info',
+      `usage options saved · cap ~${u.cap} · pre-hop ${u.preemptiveHop ? 'on' : 'off'} · poller ${u.enabled ? 'on' : 'off'}`,
+    );
+    this.broadcast();
+    return { ok: true, message: 'Usage options saved.' };
+  }
+
+  async saveSettingsFile() {
+    await fsp.writeFile(this.paths.settings, `${JSON.stringify(this.rawSettings, null, 2)}\n`, 'utf8');
   }
 
   // -- keeper --------------------------------------------------------------
@@ -2759,6 +3170,7 @@ function registerIpc() {
   ipcMain.handle('deck:connect', safe(() => deck.connect('manual')));
   ipcMain.handle('deck:disconnect', safe(() => deck.disconnect({ manual: true })));
   ipcMain.handle('deck:toggle', safe((_event, id, enabled) => deck.toggle(id, enabled)));
+  ipcMain.handle('deck:usage:options', safe((_event, patch) => deck.setUsageOptions(patch)));
   ipcMain.handle('deck:launch', safe((_event, kind) => deck.launch(kind)));
   ipcMain.handle('deck:pool:choose', safe(() => deck.choosePoolDir()));
   ipcMain.handle('deck:log:choose', safe(() => deck.chooseClientLog()));

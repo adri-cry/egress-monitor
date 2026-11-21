@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pool = require('../electron/lib/pool.cjs');
+const usage = require('../electron/lib/usage.cjs');
 const {
   Deck,
   EngineManager,
@@ -81,8 +82,8 @@ const fastSettings = {
   autoConnect: false,
 };
 
-async function writeDeckSettings(home) {
-  await fs.writeFile(path.join(home, 'settings.json'), JSON.stringify(fastSettings));
+async function writeDeckSettings(home, extra = {}) {
+  await fs.writeFile(path.join(home, 'settings.json'), JSON.stringify({ ...fastSettings, ...extra }));
 }
 
 function waitFor(predicate, timeoutMs = 6000, label = 'condition') {
@@ -883,6 +884,386 @@ await test('failed rotation keeps a live engine connected instead of stranding o
     assert.equal(deck.state.connected, false);
     assert.equal(deck.state.engine.state, 'stopped');
     assert.equal(deck.state.engine.pid, null);
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('quota line older than the committed config is dropped', async () => {
+  const home = await makeDeckHome('deck-stale-trigger');
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+    let probeCount = 0;
+    deck.probe = async () => {
+      probeCount += 1;
+      const seg = (0x2700 + probeCount).toString(16);
+      return {
+        ip: `2a09:bac5:3a1c:${seg}::1`,
+        family: 'ipv6',
+        block64: `2a09:bac5:3a1c:${seg}::/64`,
+        subnet64: `2a09:bac5:3a1c:${seg}`,
+        verified: true,
+        leaked: false,
+        directIp: null,
+        checkedAt: new Date().toISOString(),
+        error: null,
+      };
+    };
+    deck.state.egress = {
+      ip: '2a09:bac5:3a1c:2600::1',
+      family: 'ipv6',
+      block64: '2a09:bac5:3a1c:2600::/64',
+      subnet64: '2a09:bac5:3a1c:2600',
+      verified: true,
+      leaked: false,
+      directIp: null,
+      checkedAt: new Date().toISOString(),
+      error: null,
+    };
+    deck.currentEntry = deck.pool.entries[0];
+
+    // Operator hop commits config_02 (next after config_01).
+    const hop = await deck.rotate('manual');
+    assert.equal(hop.ok, true, hop.message);
+    assert.ok(deck.currentConfigSince > 0, 'commit time recorded');
+    assert.equal(deck.currentEntry.name, 'config_02.conf');
+    const hopsAfterManual = deck.state.stats.hops;
+
+    // The deferred quota line was logged BEFORE the manual hop: it belongs
+    // to the old tunnel and must not evict the config the operator picked.
+    await deck.handleGuardTrigger({
+      at: deck.currentConfigSince - 5000,
+      detectedAt: Date.now(),
+      deferred: true,
+      count: 1,
+      line: 'upstream denied request: QuotaExceeded (429)',
+      file: path.join(home, 'logs', 'client.log'),
+    });
+    assert.equal(deck.state.stats.hops, hopsAfterManual, 'stale trigger must not hop');
+    assert.equal(deck.state.stats.triggers, 0, 'dropped trigger is not counted');
+    assert.equal(deck.currentEntry.name, 'config_02.conf', 'operator config stays active');
+
+    // A genuinely fresh quota line on the committed config still hops.
+    await deck.handleGuardTrigger({
+      at: Date.now(),
+      detectedAt: Date.now(),
+      count: 2,
+      line: 'upstream denied request: QuotaExceeded (429)',
+      file: path.join(home, 'logs', 'client.log'),
+    });
+    assert.equal(deck.state.stats.hops, hopsAfterManual + 1, 'fresh trigger still hops');
+
+    await deck.logs.flush();
+    const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');
+    assert.match(guardLog, /predates config_02\.conf/, 'the drop is logged');
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('free-tier quota line hops to a fresh /64 (per-IP daily bucket)', async () => {
+  const home = await makeDeckHome('deck-free-tier');
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+    let probeCount = 0;
+    deck.probe = async () => {
+      probeCount += 1;
+      const seg = (0x2800 + probeCount).toString(16);
+      return {
+        ip: `2a09:bac5:3a1d:${seg}::1`,
+        family: 'ipv6',
+        block64: `2a09:bac5:3a1d:${seg}::/64`,
+        subnet64: `2a09:bac5:3a1d:${seg}`,
+        verified: true,
+        leaked: false,
+        directIp: null,
+        checkedAt: new Date().toISOString(),
+        error: null,
+      };
+    };
+    deck.currentEntry = deck.pool.entries[0];
+    const hop = await deck.rotate('manual');
+    assert.equal(hop.ok, true, hop.message);
+    const hopsBefore = deck.state.stats.hops;
+
+    // The zen free-tier wall is a per-egress-IP daily bucket (anonymous
+    // clients have no account): a fresh /64 is a fresh bucket, so the guard
+    // must hop, not pause until midnight.
+    const freeLine =
+      'timestamp=2026-11-21T10:56:31.168Z level=ERROR message="Failed to drain Session" cause="AI.Error: Free usage limit reached. Free models work in OpenCode"';
+    await deck.handleGuardTrigger({
+      at: Date.now(),
+      detectedAt: Date.now(),
+      count: 1,
+      line: freeLine,
+      file: path.join(home, 'logs', 'client.log'),
+    });
+    assert.equal(deck.state.stats.hops, hopsBefore + 1, 'free-tier wall triggers a hop');
+    assert.equal(deck.state.stats.triggers, 1, 'acted trigger counted');
+    assert.equal(deck.state.stats.blacklisted, 1, 'the walled /64 is retired');
+    assert.equal(deck.backoffUntil, 0, 'rotation stays armed — no midnight pause');
+
+    await deck.logs.flush();
+    const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');
+    assert.match(guardLog, /per-IP quota/, 'the per-IP bucket is explained in the log');
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('failed rotation persists the live config instead of a stale name', async () => {
+  const home = await makeDeckHome('deck-persist-live', 4);
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+    deck.engine = { child: { pid: 4242, exitCode: null, signalCode: null }, stop: async () => {} };
+    const sameBlock = {
+      ip: '2a09:bac5:3a12:25b9::1',
+      family: 'ipv6',
+      block64: '2a09:bac5:3a12:25b9::/64',
+      subnet64: '2a09:bac5:3a12:25b9',
+      verified: true,
+      leaked: false,
+      directIp: null,
+      checkedAt: new Date().toISOString(),
+      error: null,
+    };
+    deck.state.egress = { ...sameBlock };
+    deck.currentEntry = deck.pool.entries[0];
+    deck.probe = async () => ({ ...sameBlock, checkedAt: new Date().toISOString() });
+
+    const result = await deck.rotate('log-guard');
+    assert.equal(result.ok, false, 'the hop fails on the reused /64');
+    assert.equal(deck.state.connected, true, 'live engine keeps the tunnel connected');
+    // Pool walk from config_01 tries 02, 03, 04 (3 attempts per pass): the
+    // last candidate started is the config actually running.
+    assert.equal(deck.currentEntry.name, 'config_04.conf');
+    await deck.logs.flush();
+    const disk = JSON.parse(
+      await fs.readFile(path.join(home, 'runtime', 'deck-state.json'), 'utf8'),
+    );
+    assert.equal(
+      disk.currentConfig,
+      'config_04.conf',
+      'disk names the live config, not the pre-hop one',
+    );
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('failed select reflects a live engine instead of stranding offline', async () => {
+  const home = await makeDeckHome('deck-select-live');
+  await writeDeckSettings(home);
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+    deck.engine = { child: { pid: 4343, exitCode: null, signalCode: null }, stop: async () => {} };
+    deck.probe = async () => {
+      throw new Error('probe timed out after 9000ms');
+    };
+
+    const result = await deck.selectConfig('config_02.conf');
+    assert.equal(result.ok, false, 'the select fails on the probe');
+    assert.equal(deck.state.connected, true, 'live engine must not be declared stopped');
+    assert.equal(deck.state.engine.state, 'running');
+    assert.equal(deck.state.engine.pid, 4343);
+    assert.equal(deck.currentEntry.name, 'config_02.conf');
+    await deck.logs.flush();
+    const disk = JSON.parse(
+      await fs.readFile(path.join(home, 'runtime', 'deck-state.json'), 'utf8'),
+    );
+    assert.equal(disk.currentConfig, 'config_02.conf', 'disk names the selected live config');
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('usage lib counts zen requests per window and filters the rest', () => {
+  const sinceDay = Date.UTC(2026, 10, 21);
+  const sinceHop = sinceDay + 12 * 3600000;
+  const msg = (type, providerID, created) => ({ type, model: { providerID }, time: { created } });
+  const messages = [
+    msg('assistant', 'opencode', sinceHop + 1000), // hop + day
+    msg('assistant', 'opencode', sinceHop - 1000), // day only
+    msg('assistant', 'nous', sinceHop + 2000), // other provider
+    msg('user', 'opencode', sinceHop + 3000), // user entry
+    msg('idle', 'opencode', sinceHop + 4000), // idle marker
+    msg('assistant', 'opencode', sinceDay - 1000), // yesterday
+    { type: 'assistant', model: { providerID: 'opencode' } }, // no timestamp
+  ];
+  const counts = usage.countRequests(messages, { sinceHop, sinceDay });
+  assert.equal(counts.hop, 1);
+  assert.equal(counts.day, 2);
+  assert.equal(usage.startOfUtcDay(Date.UTC(2026, 10, 21, 15, 30)), sinceDay);
+  assert.equal(usage.nextUtcMidnight(sinceDay), sinceDay + 86400000);
+});
+
+await test('usage lib busy detection and pre-hop decision matrix', () => {
+  assert.equal(usage.sessionBusy({ time: { busy: 5, idle: 3 } }), true);
+  assert.equal(usage.sessionBusy({ time: { busy: 3, idle: 5 } }), false);
+  assert.equal(usage.sessionBusy({ time: { busy: 5 } }), true);
+  assert.equal(usage.sessionBusy({ time: { busy: 0, idle: 0 } }), false);
+  assert.equal(usage.sessionBusy({}), false);
+  const base = {
+    enabled: true,
+    connected: true,
+    rotating: false,
+    manualOffline: false,
+    requests: 9,
+    cap: 10,
+    hopRatio: 0.9,
+    anyBusy: false,
+    idleStreak: 2,
+    backoffUntil: 0,
+    now: 1000,
+  };
+  assert.equal(usage.shouldPreemptiveHop(base), true);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, anyBusy: true }), false, 'busy client blocks the hop');
+  assert.equal(usage.shouldPreemptiveHop({ ...base, idleStreak: 1 }), false, 'idle must be confirmed twice');
+  assert.equal(usage.shouldPreemptiveHop({ ...base, requests: 8 }), false, 'below threshold');
+  assert.equal(usage.shouldPreemptiveHop({ ...base, enabled: false }), false);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, rotating: true }), false);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, manualOffline: true }), false);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, connected: false }), false);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, backoffUntil: 2000 }), false);
+  assert.equal(usage.shouldPreemptiveHop({ ...base, cap: 0 }), false);
+});
+
+await test('Deck usageTick counts requests, warns at threshold, survives offline', async () => {
+  const home = await makeDeckHome('deck-usage-count');
+  await writeDeckSettings(home, { usage: { dailyCap: 10, preemptiveHop: false } });
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.state.connected = true;
+    deck.currentConfigSince = Date.now() - 60000;
+    const zen = (created) => ({
+      type: 'assistant',
+      model: { providerID: 'opencode', id: 'x-free' },
+      time: { created },
+    });
+    const now = Date.now();
+    const messages = [
+      ...Array.from({ length: 8 }, () => zen(now)),
+      zen(now - 120000),
+      zen(now - 120000), // earlier today, before the hop
+      { type: 'assistant', model: { providerID: 'nous' }, time: { created: now } },
+    ];
+    deck.fetchUsageData = async () => ({
+      sessions: [{ id: 's1', time: { busy: 1, idle: 2 } }],
+      messages,
+    });
+    await deck.usageTick();
+    assert.equal(deck.state.usage.reachable, true);
+    assert.equal(deck.state.usage.requests, 8, 'only zen requests on the current /64');
+    assert.equal(deck.state.usage.today, 10, 'today counts across windows');
+    assert.equal(deck.state.usage.cap, 10);
+    assert.equal(deck.state.stats.hops, 0, 'pre-hop disabled');
+    await deck.logs.flush();
+    const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');
+    assert.match(guardLog, /approaching the daily wall/, '80% warning logged');
+
+    // opencode offline: no crash, no hop, status reflects it.
+    deck.fetchUsageData = async () => {
+      throw new Error('ECONNREFUSED');
+    };
+    await deck.usageTick();
+    assert.equal(deck.state.usage.reachable, false);
+    assert.match(deck.state.usage.error, /ECONNREFUSED/);
+    assert.equal(deck.state.stats.hops, 0);
+  } finally {
+    await deck.dispose();
+  }
+});
+
+await test('Deck pre-hops at threshold only after idle is confirmed, never while busy', async () => {
+  const home = await makeDeckHome('deck-prehop');
+  await writeDeckSettings(home, { usage: { dailyCap: 10, hopRatio: 0.9, preemptiveHop: true } });
+  const deck = new Deck({ home, win: null });
+  try {
+    await deck.init();
+    deck.startEntry = async (entry) => {
+      deck.currentEntry = entry;
+    };
+    deck.scanWorkspace = async () => deck.workspaceCache;
+    let probeCount = 0;
+    deck.probe = async () => {
+      probeCount += 1;
+      const seg = (0x2900 + probeCount).toString(16);
+      return {
+        ip: `2a09:bac5:3a1e:${seg}::1`,
+        family: 'ipv6',
+        block64: `2a09:bac5:3a1e:${seg}::/64`,
+        subnet64: `2a09:bac5:3a1e:${seg}`,
+        verified: true,
+        leaked: false,
+        directIp: null,
+        checkedAt: new Date().toISOString(),
+        error: null,
+      };
+    };
+    deck.state.connected = true;
+    deck.currentConfigSince = Date.now() - 60000;
+    deck.currentEntry = deck.pool.entries[0];
+    const now = Date.now();
+    const messages = Array.from({ length: 9 }, () => ({
+      type: 'assistant',
+      model: { providerID: 'opencode' },
+      time: { created: now },
+    }));
+    deck.fetchUsageData = async () => ({
+      sessions: [{ id: 's1', time: { busy: 1, idle: 2 } }],
+      messages,
+    });
+
+    await deck.usageTick(); // idle streak 1 — not yet
+    assert.equal(deck.state.stats.hops, 0, 'first idle poll must not hop');
+    assert.equal(deck.state.usage.requests, 9);
+    await deck.usageTick(); // idle streak 2 — pre-hop
+    assert.equal(deck.state.stats.hops, 1, 'confirmed idle + threshold pre-hops');
+    assert.equal(deck.currentEntry.name, 'config_02.conf');
+    assert.equal(deck.state.usage.requests, 0, 'new /64 starts a fresh window');
+    assert.equal(deck.persisted.usageHistory.length, 1);
+    assert.equal(deck.persisted.usageHistory[0].reason, 'usage');
+    assert.equal(deck.persisted.usageHistory[0].requests, 9);
+
+    // Busy client at the same threshold: never hop.
+    deck.currentConfigSince = Date.now() - 60000;
+    deck.usageIdleStreak = 5;
+    deck.fetchUsageData = async () => ({
+      sessions: [{ id: 's1', time: { busy: 9, idle: 2 } }],
+      messages,
+    });
+    await deck.usageTick();
+    assert.equal(deck.state.stats.hops, 1, 'busy session blocks the pre-hop');
+    assert.equal(deck.state.usage.anyBusy, true);
+    assert.equal(deck.state.usage.idleStreak, 0);
+
+    await deck.logs.flush();
+    const guardLog = await fs.readFile(path.join(home, 'logs', 'guard.log'), 'utf8');
+    assert.match(guardLog, /usage pre-hop/, 'the pre-hop is logged');
   } finally {
     await deck.dispose();
   }

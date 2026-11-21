@@ -47,6 +47,26 @@ const EMPTY_STATE = {
   },
   toggles: { keeper: true, logGuard: true, desktopProxy: true, autoStart: false },
   guard: { watching: false, path: '', lastTriggerAt: null, cooldownUntil: null, triggers: 0 },
+  usage: {
+    enabled: true,
+    reachable: false,
+    checkedAt: null,
+    error: null,
+    requests: 0,
+    today: 0,
+    cap: 200,
+    ratio: 0,
+    warnRatio: 0.8,
+    hopRatio: 0.9,
+    resetAt: null,
+    preemptiveHop: true,
+    anyBusy: false,
+    sessions: 0,
+    busySessions: 0,
+    idleStreak: 0,
+    lastHopAt: null,
+    history: [],
+  },
   keeper: { running: false, lastBeatAt: null, failures: 0, intervalMs: 10000 },
   paths: { home: '', pool: '', logs: '', clientLog: '', guardLog: '', keeperLog: '', appLog: '' },
   lastError: null,
@@ -195,6 +215,11 @@ export function useDeck() {
     [bridge, run],
   );
 
+  const setUsageOptions = useCallback(
+    (patch) => run('usage:options', () => bridge.setUsageOptions(patch)),
+    [bridge, run],
+  );
+
   const copyText = useCallback(
     async (text) => {
       if (bridge?.copyText) {
@@ -251,6 +276,7 @@ export function useDeck() {
     refresh,
     launch,
     setToggle,
+    setUsageOptions,
     choosePoolDir,
     chooseClientLog,
     copyText,

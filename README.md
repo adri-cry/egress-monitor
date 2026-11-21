@@ -32,7 +32,8 @@ A hop is:
    for a quota-family line (`QuotaExceeded`, `FreeUsageLimitError`, `insufficient_quota`, HTTP 429,
    `rate limit exceeded`, …).
 2. Cooldown is checked (default 75 s); a quota line inside the window is deferred, not dropped, and
-   fires when the window closes.
+   fires when the window closes — unless it was logged before the current config was committed
+   (e.g. it outlived an operator hop), in which case it is dropped.
 3. The next `.conf` in natural filename order is rendered into a sing-box config
    (`runtime/sing-box.json`). Private keys never leave the main process.
 4. The old engine is stopped (`taskkill /T /F` on Windows, `SIGTERM` then `SIGKILL` on Linux/macOS),
@@ -200,6 +201,15 @@ app after editing; pool and log folders can also be changed from the UI.
     "staleAfterMs": 180000
   },
   "guard": { "cooldownMs": 75000 },
+  "usage": {
+    "enabled": true,
+    "pollMs": 45000,
+    "dailyCap": 200,
+    "warnRatio": 0.8,
+    "preemptiveHop": true,
+    "hopRatio": 0.9,
+    "servicePath": ""
+  },
   "keeper": { "intervalMs": 10000, "failuresBeforeRestart": 2, "heartbeatLogMs": 90000 },
   "client": {
     "desktop": { "command": "", "args": [], "cwd": "" },
@@ -248,6 +258,9 @@ inventing numbers. Point `workspaceDir` at your client's data directory to show 
   capped at 4 MB per scan with a `log-guard burst` warning if the cap is hit.
 - A quota line inside `guard.cooldownMs` is deferred, not suppressed: exactly one hop is scheduled for
   the moment the window closes, and further lines in the same window fold into that pending hop.
+- A trigger (deferred or not) whose line was logged **before the current config was committed** is
+  dropped: it describes a tunnel that is already gone, so it must not evict a config the operator
+  just hopped to, nor burn that config's /64. The drop is logged as `quota line predates <config>`.
 - The guard rotates whether or not the tunnel is currently up: `rotate()` starts the next config, so a
   trigger while offline is still a real quota event.
 - Only triggers that actually cause a hop are counted; ignored ones (guard off, hop already in flight)
@@ -262,6 +275,13 @@ inventing numbers. Point `workspaceDir` at your client's data directory to show 
 - Loop protection: if the quota wall comes back within 3 minutes of a successful hop, that hop is
   counted as failed; after two such failures auto-rotation pauses for 2 minutes instead of burning
   through the whole config pool.
+- opencode free tier (`Free usage limit reached` / `FreeUsageLimitError`): the daily request bucket
+  is keyed by **egress IP**, not an account — anonymous clients have none (zen console:
+  `IpRateLimitTable` / `createIpRateLimiter`). It is shared across all free models, roughly
+  200 requests/day per IP (community-reported, not official), and resets at 00:00 UTC / 07:00 WIB.
+  A fresh /64 is a fresh bucket, so this line triggers a normal hop. WARP /64s can arrive
+  pre-consumed by other users sharing the pool, and opencode's auto-retries compound the burn —
+  the rewall backoff brakes that churn and the burnt list keeps known-used /64s out of rotation.
 
 The watched files are `clientLogPath` (default `logs\client.log`) plus any extra paths in
 `clientLogPaths` — one entry per client that writes its own log. Both are relative to the deck home.
@@ -275,6 +295,30 @@ Every `keeper.intervalMs` the keeper checks that `127.0.0.1:41987` is listening.
 recovers automatically if the engine exits unexpectedly.
 
 The `retired /64` metric counts only configs burned by a quota trigger (`reason === 'log-guard'`).
+
+## Usage tracking & pre-emptive hop
+
+The zen free-tier daily bucket is keyed by egress IP (~200 requests/day per IP, community-reported,
+shared across all free models, resets 00:00 UTC), so the deck tracks **requests sent while the
+current /64 was active** — not a machine-wide total.
+
+- A poller (`usage.pollMs`, default 45 s) reads opencode serve's local API
+  (`~/.local/state/opencode/service.json` → `GET /api/session`, then `/api/session/{id}/message`
+  for sessions touched inside the window). It counts assistant messages with
+  `model.providerID === "opencode"` created since the current config was committed
+  (`Deck.currentConfigSince`), plus a today-since-00:00-UTC total. Local only: no egress, no quota burn.
+- The count is a **lower-bound estimate**: 429 retries may not be recorded, and a fresh WARP /64
+  can arrive pre-consumed by other users. The reactive LogGuard, burnt list and rewall backoff
+  remain the safety net. There is no official remaining-quota API yet (opencode issue #55816).
+- At `usage.warnRatio` (default 0.8) the guard logs a warning once per window and the tray icon
+  flips to `dialog-warning` (`tray.sh` feeds `runtime/tray-status.json` into `yad --listen`).
+- At `usage.hopRatio` (default 0.9) with `usage.preemptiveHop` on, the deck hops to a fresh /64
+  **only while every opencode session is idle**, confirmed across two consecutive polls
+  (`time.busy` vs `time.idle`). The previous near-cap /64 is burnt so rotation does not reuse it.
+  A failed pre-hop backs off 5 minutes. Manual hops/selects are never blocked.
+- The UI panel shows the bar, today total, reset countdown, idle/busy state, the pre-hop switch
+  (persisted to settings.json via `deck:usage:options`) and the last hops with requests used
+  (`usageHistory`, max 20, persisted in deck-state.json).
 Operator and keeper hops move the hop counter but are not retirements, and an IPv4 egress has no /64
 to record — so a healthy IPv4-only WARP session legitimately reports `retired 0`.
 
